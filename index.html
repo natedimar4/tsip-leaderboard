@@ -12,10 +12,10 @@
     <header class="site-header">
       <div class="title-block">
         <h1 id="site-title">TSIP Leaderboard</h1>
-        <p class="subtitle" id="week-range">Loading…</p>
+        <p class="subtitle" id="week-range">Loading&hellip;</p>
       </div>
       <div class="header-actions">
-        <span class="last-updated" id="last-updated">Last updated: —</span>
+        <span class="last-updated" id="last-updated">Last updated: &mdash;</span>
         <button class="btn btn-secondary" id="refresh-btn" type="button">Refresh</button>
       </div>
     </header>
@@ -41,8 +41,28 @@
             </tr>
           </thead>
           <tbody id="leaderboard-tbody">
-            <tr><td colspan="4" class="muted center">Loading…</td></tr>
+            <tr><td colspan="4" class="muted center">Loading&hellip;</td></tr>
           </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card" id="past-weeks-card" hidden>
+      <h2 class="card-title">Past weeks</h2>
+      <label class="field" style="max-width:340px">
+        <span>Pick a week to view its final leaderboard</span>
+        <select id="past-week-select"></select>
+      </label>
+      <div class="table-wrap" style="margin-top:12px">
+        <table class="leaderboard-table" id="past-week-table">
+          <thead>
+            <tr>
+              <th class="col-rank">Rank</th>
+              <th class="col-name">Name</th>
+              <th class="col-count">Tasks</th>
+            </tr>
+          </thead>
+          <tbody id="past-week-tbody"></tbody>
         </table>
       </div>
     </section>
@@ -51,10 +71,11 @@
       <details>
         <summary>How this works</summary>
         <ul>
-          <li>The leaderboard shows tasks completed <strong>this week only</strong> (Monday 12:00 AM – Sunday 11:59 PM Eastern).</li>
-          <li>Everyone resets to <strong>0</strong> every Monday morning. Past weeks don't carry over.</li>
-          <li>Click any name to see that person's week-by-week history, including last week's historical results.</li>
-          <li>Admins add task counts manually as people complete work — entries are filed into the week of their date, not the date they were typed in.</li>
+          <li>The leaderboard shows tasks completed <strong>this week only</strong> (Monday 12:00 AM &ndash; Sunday 11:59 PM Eastern).</li>
+          <li>Everyone resets to <strong>0</strong> every Monday morning. Past weeks don&rsquo;t carry over.</li>
+          <li>Click any name to see that person&rsquo;s week-by-week history.</li>
+          <li>Use the <strong>Past weeks</strong> section to view the final leaderboard from any previous week at a glance.</li>
+          <li>Admins add task counts manually as people complete work &mdash; entries are filed into the week of their date, not the date they were typed in.</li>
         </ul>
       </details>
     </section>
@@ -64,28 +85,25 @@
     </footer>
   </main>
 
-  <!-- Toast / inline status -->
   <div class="toast" id="toast" hidden></div>
 
-  <!-- History modal -->
   <div class="modal" id="history-modal" hidden>
     <div class="modal-backdrop" data-close="history-modal"></div>
     <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="history-name">
       <header class="modal-head">
         <h3 id="history-name">Name</h3>
-        <button class="icon-btn" data-close="history-modal" aria-label="Close">×</button>
+        <button class="icon-btn" data-close="history-modal" aria-label="Close">&times;</button>
       </header>
       <div class="modal-body" id="history-body"></div>
     </div>
   </div>
 
-  <!-- Password modal -->
   <div class="modal" id="password-modal" hidden>
     <div class="modal-backdrop" data-close="password-modal"></div>
     <div class="modal-card modal-card-narrow" role="dialog" aria-modal="true" aria-labelledby="password-title">
       <header class="modal-head">
         <h3 id="password-title">Admin sign-in</h3>
-        <button class="icon-btn" data-close="password-modal" aria-label="Close">×</button>
+        <button class="icon-btn" data-close="password-modal" aria-label="Close">&times;</button>
       </header>
       <div class="modal-body">
         <form id="password-form" class="form-stack">
@@ -100,16 +118,15 @@
     </div>
   </div>
 
-  <!-- Admin panel -->
   <div class="modal admin-modal" id="admin-modal" hidden>
     <div class="modal-backdrop" data-close="admin-modal"></div>
     <div class="modal-card modal-card-wide" role="dialog" aria-modal="true" aria-labelledby="admin-title">
       <header class="modal-head">
         <div>
           <h3 id="admin-title">Admin panel</h3>
-          <p class="admin-id muted small">Logged in as <strong id="admin-name-display">—</strong> · <button type="button" class="link-btn" id="change-admin-name">change</button></p>
+          <p class="admin-id muted small">Logged in as <strong id="admin-name-display">&mdash;</strong> &middot; <button type="button" class="link-btn" id="change-admin-name">change</button></p>
         </div>
-        <button class="icon-btn" data-close="admin-modal" aria-label="Close">×</button>
+        <button class="icon-btn" data-close="admin-modal" aria-label="Close">&times;</button>
       </header>
 
       <div class="modal-body admin-body">
@@ -117,28 +134,26 @@
         <details class="admin-section" open>
           <summary>How the admin panel works</summary>
           <div class="admin-instructions">
-            <p><strong>Weekly reset.</strong> Entries are assigned to weeks by their <em>date</em>, not by when you type them in. The leaderboard shows the current week (Mon 12:00 AM – Sun 11:59 PM Eastern). Everyone resets to 0 at midnight Monday automatically — there's no button to press.</p>
+            <p><strong>Weekly reset.</strong> Entries are assigned to weeks by their <em>date</em>, not by when you type them in. The leaderboard shows the current week (Mon 12:00 AM &ndash; Sun 11:59 PM Eastern). Everyone resets to 0 at midnight Monday automatically &mdash; there&rsquo;s no button to press.</p>
             <p><strong>Single entry.</strong> Pick a person (or type a new name), set the date the work was done, enter the task count, and Save.</p>
-            <p><strong>Bulk paste.</strong> Pick one date for the whole paste. Then paste rows of <code>Name &lt;tab/space/comma&gt; Count</code> — one per line. The last whitespace/comma/tab token on each line is the count; everything before it is the name (so "Jared M 12" works). Preview before saving.</p>
-            <p><strong>Editing past entries.</strong> Use the "Edit existing entries" section. You can filter by person or week, then edit or delete individual entries. Editing the date may move the entry to a different week (its <code>weekStart</code> recomputes).</p>
-            <p><strong>Adding a new person.</strong> Just type their name in the single-entry form's "or new name" field, or include it in a bulk paste — they're created on first save.</p>
-            <p><strong>Renaming someone.</strong> Use the "Rename person" tool — it updates every entry tied to that person.</p>
-            <p><strong>Your name.</strong> Set "Your name" above; every entry you save is attributed to you. Make sure it's right before saving.</p>
-            <p><strong>Backdating.</strong> If you enter a task with last Sunday's date, it lands in last week's bucket, not this week's. Use today's date for "this week" credit.</p>
+            <p><strong>Bulk paste.</strong> Pick one date for the whole paste. Then paste rows of <code>Name &lt;tab/space/comma&gt; Count</code> &mdash; one per line. The last whitespace/comma/tab token on each line is the count; everything before it is the name (so &quot;Jared M 12&quot; works). Preview before saving.</p>
+            <p><strong>Editing past entries.</strong> Use the &quot;Edit existing entries&quot; section. You can filter by person or week, then edit or delete individual entries. Editing the date may move the entry to a different week (its <code>weekStart</code> recomputes).</p>
+            <p><strong>Adding a new person.</strong> Just type their name in the single-entry form&rsquo;s &quot;or new name&quot; field, or include it in a bulk paste &mdash; they&rsquo;re created on first save.</p>
+            <p><strong>Renaming someone.</strong> Use the &quot;Rename person&quot; tool &mdash; it updates every entry tied to that person.</p>
+            <p><strong>Your name.</strong> Set &quot;Your name&quot; above; every entry you save is attributed to you. Make sure it&rsquo;s right before saving.</p>
+            <p><strong>Backdating.</strong> If you enter a task with last Sunday&rsquo;s date, it lands in last week&rsquo;s bucket, not this week&rsquo;s. Use today&rsquo;s date for &quot;this week&quot; credit.</p>
           </div>
         </details>
 
-        <!-- Historical import -->
         <details class="admin-section" id="import-section" hidden>
           <summary>One-time historical import (last week)</summary>
           <div class="admin-block">
-            <p>Pulls last week's totals (week of <strong>5/19 – 5/25</strong>) from the source Google Sheet and writes one entry per person stamped to that week. Runs only once.</p>
-            <button type="button" class="btn btn-primary" id="import-btn">Import last week's results from Google Sheet</button>
+            <p>Pulls last week&rsquo;s totals (week of <strong>5/19 &ndash; 5/25</strong>) from the source Google Sheet and writes one entry per person stamped to that week. Runs only once.</p>
+            <button type="button" class="btn btn-primary" id="import-btn">Import last week&rsquo;s results from Google Sheet</button>
             <pre class="log" id="import-log" hidden></pre>
           </div>
         </details>
 
-        <!-- Single entry -->
         <details class="admin-section" open>
           <summary>Add a single entry</summary>
           <form class="form-stack" id="single-entry-form">
@@ -146,11 +161,11 @@
               <label class="field">
                 <span>Existing person</span>
                 <select id="single-person-select">
-                  <option value="">— pick a person —</option>
+                  <option value="">&mdash; pick a person &mdash;</option>
                 </select>
               </label>
               <label class="field">
-                <span>…or new name</span>
+                <span>&hellip;or new name</span>
                 <input type="text" id="single-new-name" placeholder="e.g. Jordan K" />
               </label>
             </div>
@@ -171,7 +186,6 @@
           </form>
         </details>
 
-        <!-- Bulk paste -->
         <details class="admin-section">
           <summary>Bulk paste</summary>
           <form class="form-stack" id="bulk-form">
@@ -180,7 +194,7 @@
               <input type="date" id="bulk-date" required />
             </label>
             <label class="field">
-              <span>Paste rows — one per line. <code>Name &lt;tab/comma/space&gt; Count</code></span>
+              <span>Paste rows &mdash; one per line. <code>Name &lt;tab/comma/space&gt; Count</code></span>
               <textarea id="bulk-text" rows="8" placeholder="Antonio V    3&#10;Jared M, 12&#10;Richards C 5"></textarea>
             </label>
             <div class="form-actions">
@@ -197,7 +211,6 @@
           </form>
         </details>
 
-        <!-- Edit / delete -->
         <details class="admin-section">
           <summary>Edit existing entries</summary>
           <div class="admin-block">
@@ -205,13 +218,13 @@
               <label class="field">
                 <span>Filter by person</span>
                 <select id="edit-filter-person">
-                  <option value="">— all —</option>
+                  <option value="">&mdash; all &mdash;</option>
                 </select>
               </label>
               <label class="field">
                 <span>Filter by week</span>
                 <select id="edit-filter-week">
-                  <option value="">— all —</option>
+                  <option value="">&mdash; all &mdash;</option>
                 </select>
               </label>
             </div>
@@ -233,7 +246,6 @@
           </div>
         </details>
 
-        <!-- Rename -->
         <details class="admin-section">
           <summary>Rename a person (bulk)</summary>
           <form class="form-stack" id="rename-form">
@@ -241,7 +253,7 @@
               <label class="field">
                 <span>From</span>
                 <select id="rename-from">
-                  <option value="">— pick a person —</option>
+                  <option value="">&mdash; pick a person &mdash;</option>
                 </select>
               </label>
               <label class="field">
@@ -261,13 +273,12 @@
     </div>
   </div>
 
-  <!-- Edit-one-entry modal (nested inside admin flow) -->
   <div class="modal" id="edit-entry-modal" hidden>
     <div class="modal-backdrop" data-close="edit-entry-modal"></div>
     <div class="modal-card modal-card-narrow" role="dialog" aria-modal="true" aria-labelledby="edit-entry-title">
       <header class="modal-head">
         <h3 id="edit-entry-title">Edit entry</h3>
-        <button class="icon-btn" data-close="edit-entry-modal" aria-label="Close">×</button>
+        <button class="icon-btn" data-close="edit-entry-modal" aria-label="Close">&times;</button>
       </header>
       <div class="modal-body">
         <form class="form-stack" id="edit-entry-form">

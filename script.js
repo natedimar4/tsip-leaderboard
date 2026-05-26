@@ -261,6 +261,7 @@ function renderAll() {
   renderHeader();
   renderTable();
   renderChart();
+  renderPastWeeks();
   // Admin-side selectors / lists also use entries:
   if (state.adminUnlocked) {
     renderAdminPersonSelects();
@@ -359,6 +360,80 @@ function renderChart() {
     }],
   });
 }
+
+// =============================================================================
+// Past weeks archive
+// =============================================================================
+
+function pastWeekStarts() {
+  const current = currentWeekStart();
+  const set = new Set();
+  for (const e of state.entries) {
+    if (e.weekStart && e.weekStart !== current) set.add(e.weekStart);
+  }
+  return [...set].sort().reverse(); // most recent first
+}
+
+function leaderboardForWeek(weekStartIso) {
+  const totals = new Map(); // key -> { displayName, total }
+  for (const e of state.entries) {
+    if (e.weekStart !== weekStartIso) continue;
+    const display = e.displayName || e.name;
+    const k = nameKey(display);
+    if (!k) continue;
+    if (!totals.has(k)) totals.set(k, { displayName: display, total: 0 });
+    totals.get(k).total += (Number(e.taskCount) || 0);
+  }
+  const rows = [...totals.values()];
+  rows.sort((a, b) => {
+    if (b.total !== a.total) return b.total - a.total;
+    return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" });
+  });
+  rows.forEach((r, i) => { r.rank = i + 1; });
+  return rows;
+}
+
+function renderPastWeeks() {
+  const card   = document.getElementById("past-weeks-card");
+  const select = document.getElementById("past-week-select");
+  const tbody  = document.getElementById("past-week-tbody");
+  if (!card || !select || !tbody) return;
+
+  const weeks = pastWeekStarts();
+  if (!weeks.length) { card.hidden = true; return; }
+  card.hidden = false;
+
+  const prev = select.value;
+  select.innerHTML = weeks.map((w) => `<option value="${w}">Week of ${weekRangeLabel(w)}</option>`).join("");
+  // Keep prior selection if still valid; otherwise default to most recent.
+  select.value = (prev && weeks.includes(prev)) ? prev : weeks[0];
+
+  renderPastWeekTable(select.value);
+}
+
+function renderPastWeekTable(weekStartIso) {
+  const tbody = document.getElementById("past-week-tbody");
+  if (!tbody) return;
+  const rows = leaderboardForWeek(weekStartIso);
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="3" class="muted center">No entries for this week.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map((r) => `
+    <tr>
+      <td class="col-rank">${r.rank}</td>
+      <td class="col-name"><button class="name-link" data-history="${escapeAttr(r.displayName)}">${escapeHtml(r.displayName)}</button></td>
+      <td class="col-count">${r.total}</td>
+    </tr>
+  `).join("");
+  tbody.querySelectorAll("[data-history]").forEach((btn) => {
+    btn.addEventListener("click", () => openHistory(btn.dataset.history));
+  });
+}
+
+document.addEventListener("change", (ev) => {
+  if (ev.target?.id === "past-week-select") renderPastWeekTable(ev.target.value);
+});
 
 // =============================================================================
 // History modal
