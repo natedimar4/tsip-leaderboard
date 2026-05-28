@@ -1,9 +1,17 @@
 // =============================================================================
 // TSIP Leaderboard — script.js
 // =============================================================================
-// PASTE YOUR FIREBASE WEB CONFIG INTO FIREBASE_CONFIG BELOW.
-// Set ADMIN_PASSWORD to whatever shared password you want.
+// Reads task scores live from a Google Sheet, computes three leaderboards
+// (Full Task, Rubric-Only, Combined), and lets admins overlay corrections and
+// snapshot weekly archives via Firestore.
 
+// -----------------------------------------------------------------------------
+// CONSTANTS — paste your Firebase config below; everything else is set per spec.
+// -----------------------------------------------------------------------------
+
+// PASTE YOUR FIREBASE CONFIG INSIDE THIS OBJECT. The values below are pre-
+// filled with the existing TSIP Leaderboard project; replace them only if you
+// create a different Firebase project.
 const FIREBASE_CONFIG = {
   apiKey:            "AIzaSyD2tw6FXHushbJrY9VThpK8S7da7EELSDk",
   authDomain:        "tsip-leaderboard.firebaseapp.com",
@@ -13,142 +21,123 @@ const FIREBASE_CONFIG = {
   appId:             "1:941083332511:web:2531c94e08d2583cc9b7aa",
 };
 
+// Casual gate visible in page source — accept the tradeoff for an internal tool.
 const ADMIN_PASSWORD = "Meridian_Admin_26";
 
-const HISTORICAL_SHEET_ID    = "1uhSy4ISikJ9l9Jym9h5UkOV9phUknDsuxOY73dLRbns";
-const HISTORICAL_WEEK_START  = "2026-05-19"; // Monday of the week being imported
-const HISTORICAL_WEEK_END_DATE = "2026-05-25"; // date stamped on imported entries (Sunday)
-const TIMEZONE               = "America/New_York";
-const DROP_NAMES             = ["End"];
-const NAME_ALIASES           = {
-  "Antoniio V": "Antonio V",
-  "Jacob Coran": "Jacob C",
+// Starter sheet for first run. After that, meta.currentSheetId in Firestore wins.
+const DEFAULT_SHEET_ID = "1QZMysinEzuYnZ9x9owNtbSTE840eanBBfeExy4JKo0A";
+
+// Tab names (URL-encoded in the fetch URL — square brackets and spaces survive).
+const FULL_TASK_TAB = "Full Task";
+const RUBRIC_TAB    = "[RTF] Rubric-Only";
+
+// Column indices. 0-indexed (so B=1, C=2, G=6, H=7, K=10, M=12, U=20, W=22).
+const FULL = {
+  name: 1, redo: 2, done: 10, dateDone: 12, redoDone: 20, secondRedoDone: 22,
+};
+const RUBRIC = {
+  name: 1, redo: 2, done: 6,  dateDone: 7,  redoDone: 12,
 };
 
-// =============================================================================
-// Firebase init (modular SDK via CDN)
-// =============================================================================
+const DROP_NAMES   = ["DO NOT CLAIM"];
+const NAME_ALIASES = {};  // built-in static aliases; runtime aliases come from Firestore
+const ASSUME_YEAR  = 2026;
 
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+// -----------------------------------------------------------------------------
+// Firebase modular SDK v12.11.0 — ES module imports from official CDN.
+// -----------------------------------------------------------------------------
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
 import {
-  getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, setDoc,
-  serverTimestamp, onSnapshot, writeBatch, getDoc,
-} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  getFirestore, collection, doc, getDoc, getDocs, setDoc, deleteDoc,
+  onSnapshot, serverTimestamp,
+} from "https://www.gstatic.com/firebasejs/12.11.0/firebase-firestore.js";
 
-let app, db;
-try {
-  app = initializeApp(FIREBASE_CONFIG);
-  db  = getFirestore(app);
-} catch (err) {
-  console.error("Firebase init failed:", err);
-  showToast("Firebase init failed — check FIREBASE_CONFIG in script.js", "error");
+// -----------------------------------------------------------------------------
+// State.
+// -----------------------------------------------------------------------------
+
+const state = {
+  fb: {
+    app: null,
+    db: null,
+    status: "connecting", // "connecting" | "connected" | "error"
+    error:  null,
+  },
+  sheet: {
+    id: null,
+    raw: null,             // { fullRows: [...rows], rubricRows: [...rows] }
+    base: null,            // { fullTask: Map<key,stats>, rubric: Map<key,stats> }
+    fetching: false,
+    error: null,
+    lastFetched: null,
+  },
+  meta:     null,
+  overlays: {},   // { [personKey]: { displayName, fullTask: {completed?, redoCounter?}, rubric: {...}, addedByOverlayOnly, adjustments, updatedAt } }
+  aliases:  {},   // { [sheetNameKey_lower]: { canonical, by, at } }
+  archives: [],   // [{ id, rangeLabel, archivedAt, sourceSheetId }] (metadata only)
+  archiveCache: {}, // { weekLabel: <full archive doc> }
+  ui: {
+    tab:  "combined",       // "combined" | "fullTask" | "rubric"
+    view: "live",           // "live" | <archive doc id>
+  },
+  admin: {
+    unlocked: false,
+    name: sessionStorage.getItem("tsip_admin_name") || "",
+  },
+  charts: { board: null },
+};
+
+// -----------------------------------------------------------------------------
+// Small helpers.
+// -----------------------------------------------------------------------------
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function escapeAttr(s) { return escapeHtml(s); }
+
+function showToast(msg, kind = "") {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.className = "toast" + (kind ? " " + kind : "");
+  t.hidden = false;
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { t.hidden = true; }, 3200);
 }
 
-const entriesCol = () => collection(db, "entries");
-const metaDoc    = () => doc(db, "meta", "site");
+function openModal(id)  { const el = document.getElementById(id); if (el) el.hidden = false; }
+function closeModal(id) { const el = document.getElementById(id); if (el) el.hidden = true;  }
 
-// =============================================================================
-// Time helpers — Eastern-time week boundary
-// =============================================================================
-
-// Format `date` (Date object, defaults to now) in the configured TIMEZONE,
-// returning the calendar YYYY-MM-DD that the clock currently reads in Eastern.
-function todayIsoInTz(date = new Date()) {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: TIMEZONE,
-    year: "numeric", month: "2-digit", day: "2-digit",
+document.addEventListener("click", (e) => {
+  const closeId = e.target?.dataset?.close;
+  if (closeId) closeModal(closeId);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  ["overlay-edit-modal", "swap-modal", "history-modal", "password-modal", "admin-modal"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el && !el.hidden) closeModal(id);
   });
-  // en-CA formats as YYYY-MM-DD already.
-  return fmt.format(date);
-}
+});
 
-// Given any YYYY-MM-DD calendar date, return the Monday of that week as YYYY-MM-DD.
-// A calendar date's weekday is the same everywhere on Earth, so we use UTC math.
-function weekStartFromIso(isoDate) {
-  if (!isoDate) return null;
-  const [y, m, d] = isoDate.split("-").map(Number);
-  const utc = new Date(Date.UTC(y, m - 1, d));
-  const dow = utc.getUTCDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-  const offset = dow === 0 ? 6 : dow - 1; // days since Monday
-  const monday = new Date(Date.UTC(y, m - 1, d - offset));
-  return monday.toISOString().slice(0, 10);
-}
-
-function currentWeekStart() {
-  return weekStartFromIso(todayIsoInTz());
-}
-
-// Human label "5/19 – 5/25" given a weekStart "2026-05-19".
-function weekRangeLabel(weekStartIso) {
-  const [y, m, d] = weekStartIso.split("-").map(Number);
-  const start = new Date(Date.UTC(y, m - 1, d));
-  const end   = new Date(Date.UTC(y, m - 1, d + 6));
-  const fmt   = (dt) => `${dt.getUTCMonth() + 1}/${dt.getUTCDate()}`;
-  return `${fmt(start)} – ${fmt(end)}`;
-}
-
-function shortDate(isoDate) {
-  if (!isoDate) return "—";
-  const [y, m, d] = isoDate.split("-").map(Number);
-  return `${m}/${d}`;
-}
-
-// =============================================================================
-// Name & value normalization
-// =============================================================================
-
-function normalizeNameRaw(raw) {
-  if (raw === null || raw === undefined) return "";
-  let s = String(raw).trim().replace(/\s+/g, " ");
-  if (!s) return "";
-  if (NAME_ALIASES[s]) s = NAME_ALIASES[s];
-  return s;
-}
-
-// Returns null for drop / blank names.
-function normalizeName(raw) {
-  const s = normalizeNameRaw(raw);
-  if (!s) return null;
-  if (DROP_NAMES.includes(s)) return null;
-  return s;
-}
-
-function nameKey(displayName) {
-  return displayName ? displayName.toLowerCase() : null;
-}
-
-function parseCount(raw) {
-  if (raw === null || raw === undefined) return 0;
-  const s = String(raw).trim();
-  if (!s) return 0;
-  if (s === "-" || /^n\/a$/i.test(s)) return 0;
-  const n = Number(s.replace(/[, ]/g, ""));
-  return Number.isFinite(n) ? n : 0;
-}
-
-function truthyFlag(v) {
-  const s = String(v ?? "").trim().toLowerCase();
-  return s === "true" || s === "yes" || s === "1" || s === "x" || s === "✓" || s === "y" || s === "done" || s === "checked";
-}
-
-// =============================================================================
-// CSV parsing (RFC4180-ish; handles quoted fields, embedded newlines, "")
-// =============================================================================
+// -----------------------------------------------------------------------------
+// CSV parser (handles quoted fields, embedded newlines, escaped quotes).
+// -----------------------------------------------------------------------------
 
 function parseCsv(text) {
-  const rows = [];
-  let row = [], cell = "", inQuotes = false;
+  const rows = []; let row = [], cell = "", q = false;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
-    if (inQuotes) {
+    if (q) {
       if (c === '"') {
         if (text[i + 1] === '"') { cell += '"'; i++; }
-        else inQuotes = false;
-      } else {
-        cell += c;
-      }
+        else q = false;
+      } else cell += c;
     } else {
-      if (c === '"') inQuotes = true;
+      if (c === '"') q = true;
       else if (c === ",") { row.push(cell); cell = ""; }
       else if (c === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; }
       else if (c === "\r") { /* skip */ }
@@ -163,159 +152,513 @@ function sheetCsvUrl(sheetId, tabName) {
   return `https://docs.google.com/spreadsheets/d/${encodeURIComponent(sheetId)}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tabName)}`;
 }
 
-// =============================================================================
-// State + listeners
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Name normalization, date parsing, truthy.
+// -----------------------------------------------------------------------------
 
-const state = {
-  entries: [],            // [{id, name, displayName, taskCount, date, weekStart, enteredBy, type, createdAt}]
-  meta:    { historicalImported: false },
-  loaded:  { entries: false, meta: false },
-  adminName: sessionStorage.getItem("tsip_admin_name") || "",
-  adminUnlocked: false,
-  chart: null,
-};
+function normalizeNameRaw(raw) {
+  if (raw === null || raw === undefined) return "";
+  return String(raw).trim().replace(/\s+/g, " ");
+}
 
-function startListeners() {
-  if (!db) return;
-  onSnapshot(entriesCol(), (snap) => {
-    state.entries = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    state.loaded.entries = true;
+function applyAlias(displayName) {
+  if (!displayName) return null;
+  const k = displayName.toLowerCase();
+  // Runtime aliases (Firestore) win over built-in static aliases.
+  if (state.aliases[k]?.canonical) return state.aliases[k].canonical;
+  if (NAME_ALIASES[displayName])   return NAME_ALIASES[displayName];
+  return displayName;
+}
+
+function nameKey(displayName) { return displayName ? displayName.toLowerCase() : null; }
+
+function truthyFlag(v) {
+  return String(v ?? "").trim().toUpperCase() === "TRUE";
+}
+
+// Parse "M/D", "M/D/YY", or "M/D/YYYY" → ISO "YYYY-MM-DD". Returns null if blank.
+function normalizeDate(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?$/);
+  if (!m) return null;
+  const month = parseInt(m[1], 10);
+  const day   = parseInt(m[2], 10);
+  let year;
+  if (m[3]) {
+    const y = parseInt(m[3], 10);
+    year = y < 100 ? 2000 + y : y;
+  } else {
+    year = ASSUME_YEAR;
+  }
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+// -----------------------------------------------------------------------------
+// Firebase init + status pill.
+// -----------------------------------------------------------------------------
+
+function setStatus(status, err) {
+  state.fb.status = status;
+  state.fb.error  = err?.message || null;
+  renderStatus();
+}
+
+function renderStatus() {
+  const pill = document.getElementById("fb-status");
+  if (!pill) return;
+  pill.className = "status-pill status-" + state.fb.status;
+  pill.textContent = ({
+    connecting: "Firebase: connecting…",
+    connected:  "Firebase: connected",
+    error:      "Firebase: not connected",
+  })[state.fb.status];
+  pill.title = state.fb.status === "error"
+    ? "Click to see the error" + (state.fb.error ? "\n\n" + state.fb.error : "")
+    : "";
+
+  // Gate the Admin link when Firebase is down.
+  const adminLink = document.getElementById("admin-link");
+  if (adminLink) {
+    if (state.fb.status === "error") {
+      adminLink.disabled = true;
+      adminLink.textContent = "Admin (unavailable)";
+      adminLink.title = "Admin features unavailable — Firebase not connected";
+    } else {
+      adminLink.disabled = false;
+      adminLink.textContent = "Admin";
+      adminLink.title = "";
+    }
+  }
+}
+
+document.addEventListener("click", (e) => {
+  if (e.target?.id === "fb-status" && state.fb.status === "error") {
+    alert("Firebase didn't connect:\n\n" + (state.fb.error || "(no error message)"));
+  }
+});
+
+function initFirebase() {
+  try {
+    state.fb.app = initializeApp(FIREBASE_CONFIG);
+    state.fb.db  = getFirestore(state.fb.app);
+    setStatus("connecting");
+  } catch (err) {
+    console.error("[Firebase] init threw:", err);
+    setStatus("error", err);
+  }
+}
+
+async function probeFirebase() {
+  if (!state.fb.db) return;
+  try {
+    const snap = await getDoc(doc(state.fb.db, "meta", "site"));
+    if (snap.exists()) {
+      state.meta = snap.data();
+      console.log("[Firebase] connected, meta doc found");
+    } else {
+      console.log("[Firebase] connected, no meta doc yet (first run)");
+      const seed = { currentSheetId: DEFAULT_SHEET_ID, schemaVersion: 1, updatedAt: serverTimestamp() };
+      await setDoc(doc(state.fb.db, "meta", "site"), seed);
+      state.meta = { currentSheetId: DEFAULT_SHEET_ID, schemaVersion: 1 };
+    }
+    setStatus("connected");
+  } catch (err) {
+    console.error("[Firebase] CONNECTION FAILED:", err);
+    setStatus("error", err);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Sheet fetch.
+// -----------------------------------------------------------------------------
+
+async function fetchTab(sheetId, tabName) {
+  const res = await fetch(sheetCsvUrl(sheetId, tabName));
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} fetching tab "${tabName}". Make sure the sheet is shared "Anyone with the link can view".`);
+  }
+  return await res.text();
+}
+
+async function loadSheet(sheetId) {
+  if (!sheetId) return;
+  state.sheet.id = sheetId;
+  state.sheet.fetching = true;
+  state.sheet.error = null;
+  renderFetchState();
+  try {
+    const [fullCsv, rubricCsv] = await Promise.all([
+      fetchTab(sheetId, FULL_TASK_TAB),
+      fetchTab(sheetId, RUBRIC_TAB),
+    ]);
+    const fullRows   = parseCsv(fullCsv).slice(1);   // drop header row
+    const rubricRows = parseCsv(rubricCsv).slice(1);
+    state.sheet.raw  = { fullRows, rubricRows };
+    state.sheet.base = {
+      fullTask: scoreRows(fullRows,   FULL,   "fullTask"),
+      rubric:   scoreRows(rubricRows, RUBRIC, "rubric"),
+    };
+    state.sheet.lastFetched = new Date();
+    state.sheet.error = null;
+    logScores(state.sheet.base);
+  } catch (err) {
+    console.error("[sheet] fetch failed:", err);
+    state.sheet.error = err.message;
+  } finally {
+    state.sheet.fetching = false;
     renderAll();
-  }, (err) => {
-    console.error("entries snapshot error", err);
-    showToast("Couldn't load entries: " + err.message, "error");
-  });
-
-  onSnapshot(metaDoc(), (snap) => {
-    state.meta = snap.exists() ? snap.data() : { historicalImported: false };
-    state.loaded.meta = true;
-    renderImportSectionVisibility();
-  }, (err) => {
-    console.error("meta snapshot error", err);
-  });
-}
-
-// =============================================================================
-// Derived data
-// =============================================================================
-
-// Roster = every unique person who has ever had an entry.
-function fullRoster() {
-  const map = new Map(); // key -> displayName (first-seen wins, but we prefer the most-recently-stored displayName)
-  for (const e of state.entries) {
-    const k = nameKey(e.displayName || e.name);
-    if (!k) continue;
-    if (!map.has(k)) map.set(k, e.displayName || e.name);
   }
-  return map; // Map(key -> displayName)
 }
 
-function currentWeekTotalsByKey() {
-  const week = currentWeekStart();
-  const totals = new Map();
-  const lastUpdatedDate = new Map();
-  for (const e of state.entries) {
-    if (e.weekStart !== week) continue;
-    const k = nameKey(e.displayName || e.name);
-    if (!k) continue;
-    totals.set(k, (totals.get(k) || 0) + (Number(e.taskCount) || 0));
-    const prev = lastUpdatedDate.get(k);
-    if (!prev || (e.date && e.date > prev)) lastUpdatedDate.set(k, e.date);
-  }
-  return { totals, lastUpdatedDate };
-}
+// -----------------------------------------------------------------------------
+// Scoring — one row = one task, per spec.
+//   completed       = # rows where Done? is TRUE
+//   outstandingRedo = # rows where C=REDO AND redoDone != TRUE
+//   redoCounter     = # rows where C=REDO (+ second-redo bumps for Full Task)
+//   netScore        = max(0, completed - outstandingRedo)
+// -----------------------------------------------------------------------------
 
-function leaderboardRows() {
-  const roster = fullRoster();
-  const { totals, lastUpdatedDate } = currentWeekTotalsByKey();
-  // Make sure every roster member has a row (totals default to 0).
-  const rows = [];
-  for (const [k, displayName] of roster) {
-    rows.push({
-      key: k,
-      displayName,
-      total: totals.get(k) || 0,
-      lastUpdated: lastUpdatedDate.get(k) || null,
+function scoreRows(rows, cfg, tabKey) {
+  const buckets = new Map();
+  for (const row of rows) {
+    if (!row || !row.length) continue;
+    const rawName = (row[cfg.name] || "").trim();
+    if (!rawName) continue;
+    const aliased = applyAlias(normalizeNameRaw(rawName));
+    if (!aliased) continue;
+    if (DROP_NAMES.some((d) => d.toLowerCase() === aliased.toLowerCase())) continue;
+
+    const k = nameKey(aliased);
+    let b = buckets.get(k);
+    if (!b) {
+      b = {
+        displayName: aliased,
+        completed: 0, outstandingRedo: 0, redoCounter: 0,
+        rows: [],
+      };
+      buckets.set(k, b);
+    }
+    const done       = truthyFlag(row[cfg.done]);
+    const isRedo     = (row[cfg.redo] || "").trim().toUpperCase() === "REDO";
+    const redoDone   = truthyFlag(row[cfg.redoDone]);
+    const secondDone = cfg.secondRedoDone !== undefined && truthyFlag(row[cfg.secondRedoDone]);
+
+    if (done) b.completed++;
+    if (isRedo && !redoDone) b.outstandingRedo++;
+    if (isRedo) b.redoCounter++;
+    if (secondDone) b.redoCounter++;
+
+    b.rows.push({
+      taskId: (row[0] || "").trim().slice(0, 8),
+      date:   normalizeDate(row[cfg.dateDone]) || (row[cfg.dateDone] || "").trim() || null,
+      done, isRedo, redoDone, secondRedoDone: secondDone,
     });
   }
-  rows.sort((a, b) => {
-    if (b.total !== a.total) return b.total - a.total;
-    return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" });
-  });
+  return buckets;
+}
+
+function logScores(base) {
+  console.groupCollapsed("[scoring] Full Task");
+  for (const [, v] of base.fullTask) {
+    console.log(`  ${v.displayName}: completed=${v.completed}, outstanding=${v.outstandingRedo}, net=${Math.max(0, v.completed - v.outstandingRedo)}, redoCounter=${v.redoCounter}`);
+  }
+  console.groupEnd();
+  console.groupCollapsed("[scoring] Rubric-Only");
+  for (const [, v] of base.rubric) {
+    console.log(`  ${v.displayName}: completed=${v.completed}, outstanding=${v.outstandingRedo}, net=${Math.max(0, v.completed - v.outstandingRedo)}, redoCounter=${v.redoCounter}`);
+  }
+  console.groupEnd();
+}
+
+// Rescore (used when aliases change).
+function rescore() {
+  if (!state.sheet.raw) return;
+  state.sheet.base = {
+    fullTask: scoreRows(state.sheet.raw.fullRows,   FULL,   "fullTask"),
+    rubric:   scoreRows(state.sheet.raw.rubricRows, RUBRIC, "rubric"),
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Apply overlays.
+// -----------------------------------------------------------------------------
+
+function applyOverlaysToBoard(baseMap, tabKey) {
+  const final = new Map();
+  // Pass 1: every person in the base map, optionally overlaid.
+  for (const [k, b] of baseMap) {
+    const ov = state.overlays[k] || null;
+    const ovTab = ov?.[tabKey] || {};
+    const displayName = ov?.displayName || b.displayName;
+    const completed   = (ovTab.completed   !== undefined && ovTab.completed   !== null) ? ovTab.completed   : b.completed;
+    const redoCounter = (ovTab.redoCounter !== undefined && ovTab.redoCounter !== null) ? ovTab.redoCounter : b.redoCounter;
+    final.set(k, {
+      displayName, completed, redoCounter,
+      outstandingRedo: b.outstandingRedo,
+      baseCompleted: b.completed, baseRedoCounter: b.redoCounter,
+      hasCompletedOverlay: ovTab.completed   !== undefined && ovTab.completed   !== null,
+      hasRedoOverlay:      ovTab.redoCounter !== undefined && ovTab.redoCounter !== null,
+      netScore: Math.max(0, completed - b.outstandingRedo),
+      rows: b.rows,
+      adjustments: ov?.adjustments || [],
+    });
+  }
+  // Pass 2: overlay-only people not in the base sheet.
+  for (const [k, ov] of Object.entries(state.overlays)) {
+    if (final.has(k)) continue;
+    if (!ov.addedByOverlayOnly) continue;
+    const ovTab = ov[tabKey] || {};
+    const completed   = ovTab.completed   ?? 0;
+    const redoCounter = ovTab.redoCounter ?? 0;
+    final.set(k, {
+      displayName: ov.displayName,
+      completed, redoCounter,
+      outstandingRedo: 0,
+      baseCompleted: 0, baseRedoCounter: 0,
+      hasCompletedOverlay: ovTab.completed   !== undefined,
+      hasRedoOverlay:      ovTab.redoCounter !== undefined,
+      netScore: Math.max(0, completed),
+      rows: [],
+      adjustments: ov.adjustments || [],
+    });
+  }
+  return final;
+}
+
+function combineBoards(fullMap, rubricMap) {
+  const keys = new Set([...fullMap.keys(), ...rubricMap.keys()]);
+  const out = new Map();
+  for (const k of keys) {
+    const f = fullMap.get(k);
+    const r = rubricMap.get(k);
+    out.set(k, {
+      displayName: f?.displayName || r?.displayName || k,
+      fullTaskNet:    f?.netScore    || 0,
+      rubricNet:      r?.netScore    || 0,
+      fullTaskRedos:  f?.redoCounter || 0,
+      rubricRedos:    r?.redoCounter || 0,
+      totalRedos:    (f?.redoCounter || 0) + (r?.redoCounter || 0),
+      score:         (f?.netScore || 0) + (r?.netScore || 0),
+    });
+  }
+  return out;
+}
+
+function deriveFinalBoards() {
+  if (!state.sheet.base) return { fullTask: new Map(), rubric: new Map(), combined: new Map() };
+  const fullFinal   = applyOverlaysToBoard(state.sheet.base.fullTask, "fullTask");
+  const rubricFinal = applyOverlaysToBoard(state.sheet.base.rubric,   "rubric");
+  const combined    = combineBoards(fullFinal, rubricFinal);
+  return { fullTask: fullFinal, rubric: rubricFinal, combined };
+}
+
+// -----------------------------------------------------------------------------
+// Render — top-level.
+// -----------------------------------------------------------------------------
+
+function renderAll() {
+  renderStatus();
+  renderFetchState();
+  renderWeekSelector();
+  renderTabHeaders();
+  renderBoardAndChart();
+  if (state.admin.unlocked) {
+    renderAdminPanel();
+  }
+}
+
+function renderFetchState() {
+  const banner = document.getElementById("loading-banner");
+  if (!banner) return;
+  if (state.sheet.fetching) {
+    banner.textContent = "Fetching claim sheet…";
+    banner.className = "banner banner-info";
+    banner.hidden = false;
+  } else if (state.sheet.error) {
+    banner.textContent = "Couldn't load the claim sheet — " + state.sheet.error;
+    banner.className = "banner banner-error";
+    banner.hidden = false;
+  } else {
+    banner.hidden = true;
+  }
+  const lu = document.getElementById("last-updated");
+  if (lu) {
+    lu.textContent = state.sheet.lastFetched
+      ? "Updated " + state.sheet.lastFetched.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : "";
+  }
+}
+
+function renderWeekSelector() {
+  const sel = document.getElementById("week-select");
+  if (!sel) return;
+  const opts = [`<option value="live">Current (live)</option>`];
+  for (const a of state.archives) {
+    opts.push(`<option value="${escapeAttr(a.id)}">${escapeHtml(a.rangeLabel || a.id)}</option>`);
+  }
+  const desired = state.ui.view;
+  sel.innerHTML = opts.join("");
+  sel.value = desired === "live" ? "live" : (state.archives.some((a) => a.id === desired) ? desired : "live");
+  if (sel.value !== desired) state.ui.view = sel.value;
+}
+
+function renderTabHeaders() {
+  for (const t of ["combined", "fullTask", "rubric"]) {
+    const btn = document.getElementById("tab-" + t);
+    if (btn) {
+      const active = state.ui.tab === t;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-selected", active ? "true" : "false");
+    }
+  }
+  const label = ({ combined: "Combined", fullTask: "Full Task", rubric: "Rubric-Only" })[state.ui.tab];
+  document.getElementById("chart-title").textContent = "Top 5 — " + label;
+  document.getElementById("board-title").textContent = "Full leaderboard — " + label;
+  document.getElementById("th-score").textContent = state.ui.tab === "combined" ? "Score" : "Net score";
+  document.getElementById("th-redos").textContent = "Redos";
+}
+
+// -----------------------------------------------------------------------------
+// Render board + chart for the active tab + view.
+// -----------------------------------------------------------------------------
+
+function renderBoardAndChart() {
+  if (state.ui.view === "live") {
+    const boards = deriveFinalBoards();
+    const rows = rowsForBoard(state.ui.tab, boards);
+    renderLeaderboardRows(rows, false);
+    renderChart(rows);
+  } else {
+    const archive = state.archiveCache[state.ui.view];
+    if (!archive) {
+      // Trigger load
+      loadArchive(state.ui.view);
+      const tbody = document.getElementById("leaderboard-tbody");
+      tbody.innerHTML = `<tr><td colspan="4" class="muted center">Loading archive…</td></tr>`;
+      destroyChart();
+      return;
+    }
+    const archived = archive.boards?.[state.ui.tab] || [];
+    renderArchiveRows(archived);
+    renderArchiveChart(archived);
+  }
+}
+
+function rowsForBoard(tab, boards) {
+  let rows;
+  if (tab === "combined") {
+    rows = [...boards.combined.values()];
+    rows.sort((a, b) => (b.score - a.score) || a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
+  } else {
+    rows = [...boards[tab].values()];
+    rows.sort((a, b) => (b.netScore - a.netScore) || a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
+  }
   rows.forEach((r, i) => { r.rank = i + 1; });
   return rows;
 }
 
-function entriesForPerson(displayName) {
-  const k = nameKey(displayName);
-  return state.entries.filter((e) => nameKey(e.displayName || e.name) === k);
-}
-
-// =============================================================================
-// Rendering — public view
-// =============================================================================
-
-function renderAll() {
-  if (!state.loaded.entries) return;
-  renderHeader();
-  renderTable();
-  renderChart();
-  renderPastWeeks();
-  // Admin-side selectors / lists also use entries:
-  if (state.adminUnlocked) {
-    renderAdminPersonSelects();
-    renderEditList();
-  }
-}
-
-function renderHeader() {
-  const week = currentWeekStart();
-  document.getElementById("week-range").textContent = "Week of " + weekRangeLabel(week);
-  // Last updated = most recent date among current-week entries
-  const week_entries = state.entries.filter((e) => e.weekStart === week);
-  let last = null;
-  for (const e of week_entries) {
-    if (!last || (e.date && e.date > last)) last = e.date;
-  }
-  document.getElementById("last-updated").textContent = "Last updated: " + (last ? shortDate(last) : "—");
-}
-
-function renderTable() {
-  const rows = leaderboardRows();
+function renderLeaderboardRows(rows, archived) {
   const tbody = document.getElementById("leaderboard-tbody");
+  const overlayLegend = document.getElementById("overlay-legend");
   if (!rows.length) {
     tbody.innerHTML = `<tr><td colspan="4" class="muted center">No contributors yet.</td></tr>`;
+    if (overlayLegend) overlayLegend.hidden = true;
     return;
   }
-  tbody.innerHTML = rows.map((r) => `
-    <tr>
-      <td class="col-rank">${r.rank}</td>
-      <td class="col-name"><button class="name-link" data-history="${escapeAttr(r.displayName)}">${escapeHtml(r.displayName)}</button></td>
-      <td class="col-count">${r.total}</td>
-      <td class="col-updated">${r.lastUpdated ? shortDate(r.lastUpdated) : "—"}</td>
-    </tr>
-  `).join("");
+  let anyOverlay = false;
+  if (state.ui.tab === "combined") {
+    tbody.innerHTML = rows.map((r) => `
+      <tr>
+        <td class="col-rank">${r.rank}</td>
+        <td class="col-name"><button class="name-link" data-history="${escapeAttr(r.displayName)}">${escapeHtml(r.displayName)}</button></td>
+        <td class="col-count">${r.score}</td>
+        <td class="col-redo">${r.totalRedos}</td>
+      </tr>
+    `).join("");
+  } else {
+    tbody.innerHTML = rows.map((r) => {
+      if (r.hasCompletedOverlay || r.hasRedoOverlay) anyOverlay = true;
+      const ovScore = r.hasCompletedOverlay ? ' <span class="overlay-mark" title="Overlay applied">&bull;</span>' : "";
+      const ovRedo  = r.hasRedoOverlay      ? ' <span class="overlay-mark" title="Overlay applied">&bull;</span>' : "";
+      return `
+        <tr>
+          <td class="col-rank">${r.rank}</td>
+          <td class="col-name"><button class="name-link" data-history="${escapeAttr(r.displayName)}">${escapeHtml(r.displayName)}</button></td>
+          <td class="col-count">${r.netScore}${ovScore}</td>
+          <td class="col-redo">${r.redoCounter}${ovRedo}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+  if (overlayLegend) overlayLegend.hidden = !anyOverlay;
 
   tbody.querySelectorAll("[data-history]").forEach((btn) => {
     btn.addEventListener("click", () => openHistory(btn.dataset.history));
   });
 }
 
-function renderChart() {
-  const rows = leaderboardRows().slice(0, 5);
-  // Chart.js horizontal bar: bigger bars at top → reverse so highest is rendered first
-  const labels = rows.map((r) => r.displayName);
-  const values = rows.map((r) => r.total);
-  const allZero = values.every((v) => v === 0);
-  const emptyMsg = document.getElementById("chart-empty");
-  emptyMsg.hidden = !allZero;
+function renderArchiveRows(archivedRows) {
+  const tbody = document.getElementById("leaderboard-tbody");
+  if (!archivedRows.length) {
+    tbody.innerHTML = `<tr><td colspan="4" class="muted center">No contributors in this archive.</td></tr>`;
+    return;
+  }
+  if (state.ui.tab === "combined") {
+    tbody.innerHTML = archivedRows.map((r) => `
+      <tr>
+        <td class="col-rank">${r.rank}</td>
+        <td class="col-name"><button class="name-link" data-archived-name="${escapeAttr(r.name)}">${escapeHtml(r.name)}</button></td>
+        <td class="col-count">${r.score}</td>
+        <td class="col-redo">${r.totalRedos}</td>
+      </tr>
+    `).join("");
+  } else {
+    tbody.innerHTML = archivedRows.map((r) => `
+      <tr>
+        <td class="col-rank">${r.rank}</td>
+        <td class="col-name"><button class="name-link" data-archived-name="${escapeAttr(r.name)}">${escapeHtml(r.name)}</button></td>
+        <td class="col-count">${r.netScore}</td>
+        <td class="col-redo">${r.redoCounter}</td>
+      </tr>
+    `).join("");
+  }
+  tbody.querySelectorAll("[data-archived-name]").forEach((btn) => {
+    btn.addEventListener("click", () => openArchiveHistory(btn.dataset.archivedName));
+  });
+}
 
-  const ctx = document.getElementById("top5-chart").getContext("2d");
-  if (state.chart) { state.chart.destroy(); state.chart = null; }
-  if (!labels.length || allZero) return;
+// -----------------------------------------------------------------------------
+// Chart.
+// -----------------------------------------------------------------------------
 
-  state.chart = new Chart(ctx, {
+function destroyChart() {
+  if (state.charts.board) { state.charts.board.destroy(); state.charts.board = null; }
+}
+
+function renderChart(rows) {
+  const top = rows.slice(0, 5);
+  const labels = top.map((r) => r.displayName);
+  const values = top.map((r) => state.ui.tab === "combined" ? r.score : r.netScore);
+  drawBarChart(labels, values);
+}
+
+function renderArchiveChart(archivedRows) {
+  const top = archivedRows.slice(0, 5);
+  const labels = top.map((r) => r.name);
+  const values = top.map((r) => state.ui.tab === "combined" ? r.score : r.netScore);
+  drawBarChart(labels, values);
+}
+
+function drawBarChart(labels, values) {
+  const empty = !labels.length || values.every((v) => v === 0);
+  const emptyEl = document.getElementById("chart-empty");
+  emptyEl.hidden = !empty;
+  const ctx = document.getElementById("board-chart").getContext("2d");
+  destroyChart();
+  if (empty) return;
+  state.charts.board = new Chart(ctx, {
     type: "bar",
     data: {
       labels,
@@ -331,9 +674,8 @@ function renderChart() {
       responsive: true,
       maintainAspectRatio: false,
       plugins: {
-        legend: { display: false },
-        tooltip: { callbacks: { label: (c) => `${c.parsed.x} task${c.parsed.x === 1 ? "" : "s"}` } },
-        // Custom plugin (datalabels not bundled in UMD) — we draw counts via afterDatasetDraw
+        legend:  { display: false },
+        tooltip: { callbacks: { label: (c) => String(c.parsed.x) } },
       },
       scales: {
         x: { beginAtZero: true, ticks: { precision: 0 }, grid: { color: "rgba(0,0,0,0.05)" } },
@@ -344,14 +686,13 @@ function renderChart() {
     plugins: [{
       id: "barLabels",
       afterDatasetsDraw(chart) {
-        const { ctx, data, scales } = chart;
+        const { ctx, data } = chart;
         ctx.save();
         ctx.font = "600 12px " + getComputedStyle(document.body).fontFamily;
         ctx.fillStyle = "#1b1f2a";
         ctx.textBaseline = "middle";
         data.datasets[0].data.forEach((val, i) => {
-          const meta = chart.getDatasetMeta(0);
-          const bar  = meta.data[i];
+          const bar = chart.getDatasetMeta(0).data[i];
           if (!bar) return;
           ctx.fillText(String(val), bar.x + 6, bar.y);
         });
@@ -361,851 +702,691 @@ function renderChart() {
   });
 }
 
-// =============================================================================
-// Past weeks archive
-// =============================================================================
-
-function pastWeekStarts() {
-  const current = currentWeekStart();
-  const set = new Set();
-  for (const e of state.entries) {
-    if (e.weekStart && e.weekStart !== current) set.add(e.weekStart);
-  }
-  return [...set].sort().reverse(); // most recent first
-}
-
-function leaderboardForWeek(weekStartIso) {
-  const totals = new Map(); // key -> { displayName, total }
-  for (const e of state.entries) {
-    if (e.weekStart !== weekStartIso) continue;
-    const display = e.displayName || e.name;
-    const k = nameKey(display);
-    if (!k) continue;
-    if (!totals.has(k)) totals.set(k, { displayName: display, total: 0 });
-    totals.get(k).total += (Number(e.taskCount) || 0);
-  }
-  const rows = [...totals.values()];
-  rows.sort((a, b) => {
-    if (b.total !== a.total) return b.total - a.total;
-    return a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" });
-  });
-  rows.forEach((r, i) => { r.rank = i + 1; });
-  return rows;
-}
-
-function renderPastWeeks() {
-  const card   = document.getElementById("past-weeks-card");
-  const select = document.getElementById("past-week-select");
-  const tbody  = document.getElementById("past-week-tbody");
-  if (!card || !select || !tbody) return;
-
-  const weeks = pastWeekStarts();
-  if (!weeks.length) { card.hidden = true; return; }
-  card.hidden = false;
-
-  const prev = select.value;
-  select.innerHTML = weeks.map((w) => `<option value="${w}">Week of ${weekRangeLabel(w)}</option>`).join("");
-  // Keep prior selection if still valid; otherwise default to most recent.
-  select.value = (prev && weeks.includes(prev)) ? prev : weeks[0];
-
-  renderPastWeekTable(select.value);
-}
-
-function renderPastWeekTable(weekStartIso) {
-  const tbody = document.getElementById("past-week-tbody");
-  if (!tbody) return;
-  const rows = leaderboardForWeek(weekStartIso);
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="3" class="muted center">No entries for this week.</td></tr>`;
-    return;
-  }
-  tbody.innerHTML = rows.map((r) => `
-    <tr>
-      <td class="col-rank">${r.rank}</td>
-      <td class="col-name"><button class="name-link" data-history="${escapeAttr(r.displayName)}">${escapeHtml(r.displayName)}</button></td>
-      <td class="col-count">${r.total}</td>
-    </tr>
-  `).join("");
-  tbody.querySelectorAll("[data-history]").forEach((btn) => {
-    btn.addEventListener("click", () => openHistory(btn.dataset.history));
-  });
-}
-
-document.addEventListener("change", (ev) => {
-  if (ev.target?.id === "past-week-select") renderPastWeekTable(ev.target.value);
-});
-
-// =============================================================================
-// History modal
-// =============================================================================
+// -----------------------------------------------------------------------------
+// History modal — live and archived flavours.
+// -----------------------------------------------------------------------------
 
 function openHistory(displayName) {
-  const entries = entriesForPerson(displayName);
-  const byWeek  = new Map();
-  for (const e of entries) {
-    if (!e.weekStart) continue;
-    if (!byWeek.has(e.weekStart)) byWeek.set(e.weekStart, []);
-    byWeek.get(e.weekStart).push(e);
-  }
-  const weeks = [...byWeek.keys()].sort().reverse(); // most recent first
-  const html = weeks.length
-    ? weeks.map((ws) => {
-        const list = byWeek.get(ws).slice().sort((a, b) => (a.date || "").localeCompare(b.date || ""));
-        const total = list.reduce((s, e) => s + (Number(e.taskCount) || 0), 0);
-        return `
-          <div class="history-week">
-            <div class="history-week-head">
-              <span>Week of ${weekRangeLabel(ws)}</span>
-              <span class="total">${total} task${total === 1 ? "" : "s"}</span>
-            </div>
-            <table>
-              <thead><tr><th>Date</th><th>Tasks</th><th>Type</th><th>Entered by</th></tr></thead>
-              <tbody>
-                ${list.map((e) => `
-                  <tr>
-                    <td>${shortDate(e.date)}</td>
-                    <td>${Number(e.taskCount) || 0}</td>
-                    <td>${e.type || "manual"}</td>
-                    <td>${escapeHtml(e.enteredBy || "—")}</td>
-                  </tr>`).join("")}
-              </tbody>
-            </table>
-          </div>
-        `;
-      }).join("")
-    : `<p class="muted">No entries yet for this person.</p>`;
+  const k = nameKey(displayName);
+  const boards = deriveFinalBoards();
+  const f = boards.fullTask.get(k);
+  const r = boards.rubric.get(k);
+  const c = boards.combined.get(k);
+
+  const ovInfo = state.overlays[k] || null;
+  const adjustments = ovInfo?.adjustments || [];
+
+  const sectionFor = (label, stats, isFull) => {
+    if (!stats) return "";
+    const ovStar = (b) => b ? ' <span class="overlay-mark" title="Overlay applied">&bull;</span>' : "";
+    const sampleRows = (stats.rows || []).slice(0, 12);
+    return `
+      <div class="history-section">
+        <div class="history-section-head">
+          <span>${escapeHtml(label)}</span>
+          <span class="total">Net ${stats.netScore} · Redos ${stats.redoCounter}</span>
+        </div>
+        <table>
+          <thead>
+            <tr><th>Field</th><th>Live</th><th>After overlay</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Completed</td><td>${stats.baseCompleted}</td><td>${stats.completed}${ovStar(stats.hasCompletedOverlay)}</td></tr>
+            <tr><td>Outstanding redos</td><td>${stats.outstandingRedo}</td><td>${stats.outstandingRedo}</td></tr>
+            <tr><td>Net score</td><td>${Math.max(0, stats.baseCompleted - stats.outstandingRedo)}</td><td>${stats.netScore}</td></tr>
+            <tr><td>Redo counter</td><td>${stats.baseRedoCounter}</td><td>${stats.redoCounter}${ovStar(stats.hasRedoOverlay)}</td></tr>
+          </tbody>
+        </table>
+        ${sampleRows.length ? `
+          <table>
+            <thead>
+              <tr><th>Task</th><th>Date</th><th>Done</th><th>Redo</th><th>Re-Do done</th>${isFull ? "<th>2nd redo done</th>" : ""}</tr>
+            </thead>
+            <tbody>
+              ${sampleRows.map((row) => `
+                <tr>
+                  <td>${escapeHtml(row.taskId || "—")}</td>
+                  <td>${escapeHtml(row.date || "—")}</td>
+                  <td>${row.done ? "✓" : "·"}</td>
+                  <td>${row.isRedo ? "REDO" : ""}</td>
+                  <td>${row.redoDone ? "✓" : (row.isRedo ? "·" : "")}</td>
+                  ${isFull ? `<td>${row.secondRedoDone ? "✓" : ""}</td>` : ""}
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+          ${stats.rows.length > sampleRows.length ? `<p class="muted small" style="margin:6px 12px">…and ${stats.rows.length - sampleRows.length} more rows.</p>` : ""}
+        ` : ""}
+      </div>
+    `;
+  };
+
+  const combinedHtml = c ? `
+    <div class="history-section">
+      <div class="history-section-head">
+        <span>Combined</span>
+        <span class="total">Score ${c.score} · Redos ${c.totalRedos}</span>
+      </div>
+      <table>
+        <thead><tr><th>Source</th><th>Net</th><th>Redos</th></tr></thead>
+        <tbody>
+          <tr><td>Full Task</td><td>${c.fullTaskNet}</td><td>${c.fullTaskRedos}</td></tr>
+          <tr><td>Rubric-Only</td><td>${c.rubricNet}</td><td>${c.rubricRedos}</td></tr>
+        </tbody>
+      </table>
+    </div>
+  ` : "";
+
+  const adjHtml = adjustments.length ? `
+    <div class="history-section">
+      <div class="history-section-head"><span>Admin adjustments</span><span class="total muted">${adjustments.length}</span></div>
+      <ul class="adj-list" style="margin:8px 12px">
+        ${adjustments.slice().reverse().map((a) => `
+          <li>
+            ${escapeHtml(a.board)}.${escapeHtml(a.field)}:
+            ${escapeHtml(String(a.from ?? "—"))} → ${escapeHtml(String(a.to ?? "—"))}
+            <span class="muted">by ${escapeHtml(a.by || "—")}${a.at?.seconds ? " on " + new Date(a.at.seconds * 1000).toLocaleString() : ""}</span>
+          </li>
+        `).join("")}
+      </ul>
+    </div>
+  ` : "";
+
+  const body = combinedHtml
+    + sectionFor("Full Task",   f, true)
+    + sectionFor("Rubric-Only", r, false)
+    + adjHtml;
 
   document.getElementById("history-name").textContent = displayName;
+  document.getElementById("history-body").innerHTML = body || `<p class="muted">No data for this person.</p>`;
+  openModal("history-modal");
+}
+
+function openArchiveHistory(name) {
+  const archive = state.archiveCache[state.ui.view];
+  if (!archive) return;
+  const ph = (archive.perPersonHistory || {})[nameKey(name)];
+  const html = ph
+    ? `
+      <p class="muted small">From archived snapshot — read only.</p>
+      <pre class="log">${escapeHtml(JSON.stringify(ph, null, 2))}</pre>
+    `
+    : `<p class="muted">No detailed history stored for this person in this archive.</p>`;
+  document.getElementById("history-name").textContent = name;
   document.getElementById("history-body").innerHTML = html;
   openModal("history-modal");
 }
 
-// =============================================================================
-// Modal helpers
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Listeners — Firestore real-time subscriptions.
+// -----------------------------------------------------------------------------
 
-function openModal(id)  { document.getElementById(id).hidden = false; }
-function closeModal(id) { document.getElementById(id).hidden = true; }
+function startListeners() {
+  if (state.fb.status === "error" || !state.fb.db) return;
+  const db = state.fb.db;
 
-document.addEventListener("click", (e) => {
-  const closeId = e.target?.dataset?.close;
-  if (closeId) closeModal(closeId);
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key !== "Escape") return;
-  ["history-modal", "password-modal", "edit-entry-modal", "admin-modal"].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el && !el.hidden) closeModal(id);
-  });
-});
+  onSnapshot(doc(db, "meta", "site"), (snap) => {
+    if (!snap.exists()) return;
+    const m = snap.data();
+    const sheetChanged = state.meta?.currentSheetId !== m.currentSheetId;
+    state.meta = m;
+    const sheetIdEl = document.getElementById("current-sheet-id");
+    if (sheetIdEl) sheetIdEl.textContent = m.currentSheetId || "—";
+    if (sheetChanged && m.currentSheetId) loadSheet(m.currentSheetId);
+  }, (err) => console.error("[meta listener]", err));
 
-// =============================================================================
-// Public refresh button
-// =============================================================================
+  onSnapshot(collection(db, "overlays"), (snap) => {
+    const next = {};
+    snap.forEach((d) => { next[d.id] = d.data(); });
+    state.overlays = next;
+    renderAll();
+  }, (err) => console.error("[overlays listener]", err));
 
-document.getElementById("refresh-btn").addEventListener("click", () => {
-  // Listener already keeps state live; trigger a re-render and toast.
-  renderAll();
-  showToast("Refreshed.");
-});
+  onSnapshot(collection(db, "aliases"), (snap) => {
+    const next = {};
+    snap.forEach((d) => { next[d.id] = d.data(); });
+    state.aliases = next;
+    rescore();
+    renderAll();
+  }, (err) => console.error("[aliases listener]", err));
 
-// =============================================================================
-// Admin: password gate
-// =============================================================================
+  onSnapshot(collection(db, "archives"), (snap) => {
+    const arr = [];
+    snap.forEach((d) => { arr.push({ id: d.id, ...d.data() }); });
+    arr.sort((a, b) => (b.archivedAt?.seconds || 0) - (a.archivedAt?.seconds || 0));
+    state.archives = arr;
+    renderWeekSelector();
+  }, (err) => console.error("[archives listener]", err));
+}
 
-document.getElementById("admin-link").addEventListener("click", () => {
-  if (state.adminUnlocked) {
-    openAdmin();
-  } else {
-    document.getElementById("password-error").hidden = true;
-    document.getElementById("password-input").value = "";
-    openModal("password-modal");
-    setTimeout(() => document.getElementById("password-input").focus(), 60);
+async function loadArchive(weekLabel) {
+  if (state.archiveCache[weekLabel]) return state.archiveCache[weekLabel];
+  if (!state.fb.db) return null;
+  try {
+    const snap = await getDoc(doc(state.fb.db, "archives", weekLabel));
+    if (snap.exists()) {
+      state.archiveCache[weekLabel] = snap.data();
+      renderBoardAndChart();
+      return state.archiveCache[weekLabel];
+    }
+  } catch (err) {
+    console.error("[archive load]", err);
+    showToast("Couldn't load that archive.", "error");
   }
-});
+  return null;
+}
 
-document.getElementById("password-form").addEventListener("submit", (ev) => {
+// -----------------------------------------------------------------------------
+// Event wiring.
+// -----------------------------------------------------------------------------
+
+function attachEvents() {
+  // Tabs
+  for (const t of ["combined", "fullTask", "rubric"]) {
+    document.getElementById("tab-" + t).addEventListener("click", () => {
+      state.ui.tab = t;
+      renderTabHeaders();
+      renderBoardAndChart();
+    });
+  }
+  // Week selector
+  document.getElementById("week-select").addEventListener("change", (e) => {
+    state.ui.view = e.target.value;
+    renderBoardAndChart();
+  });
+  // Refresh
+  document.getElementById("refresh-btn").addEventListener("click", () => {
+    const sheetId = state.meta?.currentSheetId || DEFAULT_SHEET_ID;
+    loadSheet(sheetId);
+  });
+  // Admin link
+  document.getElementById("admin-link").addEventListener("click", openAdminGate);
+  // Admin name change
+  document.getElementById("change-admin-name").addEventListener("click", changeAdminName);
+  // Password form
+  document.getElementById("password-form").addEventListener("submit", onPasswordSubmit);
+  // Add-person form
+  document.getElementById("add-person-form").addEventListener("submit", onAddPersonSubmit);
+  // Alias form
+  document.getElementById("alias-form").addEventListener("submit", onAliasSubmit);
+  // Overlay edit
+  document.getElementById("overlay-edit-form").addEventListener("submit", onOverlayEditSubmit);
+  document.getElementById("overlay-clear-all").addEventListener("click", onOverlayClearAll);
+  // Swap week
+  document.getElementById("swap-week-btn").addEventListener("click", () => {
+    document.getElementById("swap-error").hidden = true;
+    document.getElementById("swap-url").value = "";
+    document.getElementById("swap-label").value = guessRangeLabel();
+    openModal("swap-modal");
+  });
+  document.getElementById("swap-form").addEventListener("submit", onSwapSubmit);
+}
+
+// -----------------------------------------------------------------------------
+// Admin: gate + name.
+// -----------------------------------------------------------------------------
+
+function openAdminGate() {
+  if (state.fb.status === "error") {
+    showToast("Firebase not connected — admin unavailable.", "error");
+    return;
+  }
+  if (state.admin.unlocked) { openAdmin(); return; }
+  document.getElementById("password-error").hidden = true;
+  document.getElementById("password-input").value = "";
+  openModal("password-modal");
+  setTimeout(() => document.getElementById("password-input").focus(), 60);
+}
+
+function onPasswordSubmit(ev) {
   ev.preventDefault();
   const val = document.getElementById("password-input").value;
   if (val === ADMIN_PASSWORD) {
-    state.adminUnlocked = true;
+    state.admin.unlocked = true;
     closeModal("password-modal");
     openAdmin();
   } else {
     document.getElementById("password-error").hidden = false;
   }
-});
+}
 
 function openAdmin() {
   ensureAdminName();
-  document.getElementById("single-date").value = todayIsoInTz();
-  document.getElementById("bulk-date").value   = todayIsoInTz();
-  renderAdminPersonSelects();
-  renderEditList();
-  renderImportSectionVisibility();
+  renderAdminPanel();
   openModal("admin-modal");
 }
 
 function ensureAdminName() {
-  if (!state.adminName) {
-    const entered = prompt("Enter your name (used to attribute entries):", "");
-    if (entered && entered.trim()) {
-      state.adminName = entered.trim();
-      sessionStorage.setItem("tsip_admin_name", state.adminName);
-    } else {
-      state.adminName = "Admin";
-      sessionStorage.setItem("tsip_admin_name", state.adminName);
-    }
+  if (!state.admin.name) {
+    const v = prompt("Enter your name (used to attribute adjustments):", "");
+    state.admin.name = (v && v.trim()) || "Admin";
+    sessionStorage.setItem("tsip_admin_name", state.admin.name);
   }
-  document.getElementById("admin-name-display").textContent = state.adminName;
+  document.getElementById("admin-name-display").textContent = state.admin.name;
 }
 
-document.getElementById("change-admin-name").addEventListener("click", () => {
-  const entered = prompt("Your name:", state.adminName || "");
-  if (entered && entered.trim()) {
-    state.adminName = entered.trim();
-    sessionStorage.setItem("tsip_admin_name", state.adminName);
-    document.getElementById("admin-name-display").textContent = state.adminName;
-  }
-});
-
-// =============================================================================
-// Admin: person select population
-// =============================================================================
-
-function renderAdminPersonSelects() {
-  const roster = [...fullRoster().values()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-  for (const id of ["single-person-select", "rename-from", "edit-filter-person"]) {
-    const sel = document.getElementById(id);
-    if (!sel) continue;
-    const prev = sel.value;
-    sel.innerHTML = (id === "edit-filter-person"
-      ? `<option value="">— all —</option>`
-      : `<option value="">— pick a person —</option>`)
-      + roster.map((n) => `<option value="${escapeAttr(n)}">${escapeHtml(n)}</option>`).join("");
-    if (prev && roster.includes(prev)) sel.value = prev;
-  }
-  const weekFilter = document.getElementById("edit-filter-week");
-  if (weekFilter) {
-    const weeks = [...new Set(state.entries.map((e) => e.weekStart).filter(Boolean))].sort().reverse();
-    const prev = weekFilter.value;
-    weekFilter.innerHTML = `<option value="">— all —</option>`
-      + weeks.map((w) => `<option value="${w}">Week of ${weekRangeLabel(w)}</option>`).join("");
-    if (prev && weeks.includes(prev)) weekFilter.value = prev;
+function changeAdminName() {
+  const v = prompt("Your name:", state.admin.name || "");
+  if (v && v.trim()) {
+    state.admin.name = v.trim();
+    sessionStorage.setItem("tsip_admin_name", state.admin.name);
+    document.getElementById("admin-name-display").textContent = state.admin.name;
   }
 }
 
-// =============================================================================
-// Admin: single entry
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Admin panel rendering.
+// -----------------------------------------------------------------------------
 
-document.getElementById("single-entry-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const errEl = document.getElementById("single-error");
-  errEl.hidden = true;
-  const saveBtn = document.getElementById("single-save");
-  saveBtn.disabled = true;
+function renderAdminPanel() {
+  document.getElementById("current-sheet-id").textContent = state.meta?.currentSheetId || "—";
+  renderOverridesTable();
+  renderAliasesTable();
+}
 
-  try {
-    const sel = document.getElementById("single-person-select").value.trim();
-    const nu  = document.getElementById("single-new-name").value.trim();
-    const displayName = normalizeName(nu || sel);
-    if (!displayName) throw new Error("Pick or type a name.");
-    const dateIso = document.getElementById("single-date").value;
-    if (!dateIso) throw new Error("Pick a date.");
-    const count = parseCount(document.getElementById("single-count").value);
-    if (count < 0) throw new Error("Task count must be ≥ 0.");
-
-    await addDoc(entriesCol(), {
-      name: nameKey(displayName),
-      displayName,
-      taskCount: count,
-      date: dateIso,
-      weekStart: weekStartFromIso(dateIso),
-      enteredBy: state.adminName || "Admin",
-      type: "manual",
-      createdAt: serverTimestamp(),
-    });
-    showToast(`Saved: ${displayName} +${count}`, "success");
-    document.getElementById("single-new-name").value = "";
-    document.getElementById("single-person-select").value = "";
-    document.getElementById("single-count").value = 1;
-  } catch (err) {
-    console.error(err);
-    errEl.textContent = err.message;
-    errEl.hidden = false;
-  } finally {
-    saveBtn.disabled = false;
-  }
-});
-
-// =============================================================================
-// Admin: bulk paste
-// =============================================================================
-
-let bulkPreviewRows = null;
-
-document.getElementById("bulk-preview-btn").addEventListener("click", () => {
-  const text = document.getElementById("bulk-text").value;
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const parsed = [];
-  for (const line of lines) {
-    // Try comma, tab, then whitespace.
-    let tokens = line.split(/\t|,/).map((t) => t.trim()).filter(Boolean);
-    if (tokens.length < 2) tokens = line.split(/\s+/);
-    // Last token = count, rest = name.
-    const last = tokens[tokens.length - 1];
-    const countStr = last;
-    const nameTokens = tokens.slice(0, -1);
-    let name = nameTokens.join(" ").trim();
-    // If user pasted "Name 12" with no separator, the regex above already handled it.
-    if (!name) { parsed.push({ raw: line, name: "", count: 0, error: "No name found" }); continue; }
-    const norm = normalizeName(name);
-    if (!norm) { parsed.push({ raw: line, name, count: parseCount(countStr), error: `Dropped/blank name` }); continue; }
-    const count = parseCount(countStr);
-    if (!Number.isFinite(Number(countStr.replace(/[, ]/g, "")))) {
-      parsed.push({ raw: line, name: norm, count, error: "Count isn't a number — defaulted to 0" });
-    } else {
-      parsed.push({ raw: line, name: norm, count, error: null });
-    }
-  }
-  bulkPreviewRows = parsed;
-  const wrap  = document.getElementById("bulk-preview-wrap");
-  const tbody = wrap.querySelector("tbody");
-  if (!parsed.length) {
-    wrap.hidden = true;
-    document.getElementById("bulk-save-btn").disabled = true;
-    return;
-  }
-  tbody.innerHTML = parsed.map((r) => `
-    <tr>
-      <td>${escapeHtml(r.name || r.raw)}</td>
-      <td>${r.count}</td>
-      <td>${r.error ? `<span class="error">${escapeHtml(r.error)}</span>` : `<span class="success">OK</span>`}</td>
-    </tr>
-  `).join("");
-  wrap.hidden = false;
-  const anyValid = parsed.some((r) => !r.error || /defaulted/.test(r.error));
-  document.getElementById("bulk-save-btn").disabled = !anyValid;
-});
-
-document.getElementById("bulk-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  if (!bulkPreviewRows || !bulkPreviewRows.length) { showToast("Click Preview first.", "error"); return; }
-  const dateIso = document.getElementById("bulk-date").value;
-  if (!dateIso) { showToast("Pick a date.", "error"); return; }
-  const weekStart = weekStartFromIso(dateIso);
-  const saveBtn = document.getElementById("bulk-save-btn");
-  saveBtn.disabled = true;
-  try {
-    const batch = writeBatch(db);
-    let count = 0;
-    for (const r of bulkPreviewRows) {
-      // Skip rows with no usable name; allow rows with a 0 count.
-      const norm = normalizeName(r.name);
-      if (!norm) continue;
-      const ref = doc(entriesCol());
-      batch.set(ref, {
-        name: nameKey(norm),
-        displayName: norm,
-        taskCount: r.count || 0,
-        date: dateIso,
-        weekStart,
-        enteredBy: state.adminName || "Admin",
-        type: "manual",
-        createdAt: serverTimestamp(),
-      });
-      count++;
-    }
-    await batch.commit();
-    showToast(`Saved ${count} entries.`, "success");
-    document.getElementById("bulk-text").value = "";
-    document.getElementById("bulk-preview-wrap").hidden = true;
-    bulkPreviewRows = null;
-  } catch (err) {
-    console.error(err);
-    showToast("Bulk save failed: " + err.message, "error");
-  } finally {
-    saveBtn.disabled = false;
-  }
-});
-
-// =============================================================================
-// Admin: edit / delete
-// =============================================================================
-
-document.getElementById("edit-filter-person").addEventListener("change", renderEditList);
-document.getElementById("edit-filter-week").addEventListener("change", renderEditList);
-
-function renderEditList() {
-  const tbody = document.querySelector("#edit-table tbody");
+function renderOverridesTable() {
+  const tbody = document.getElementById("overrides-tbody");
   if (!tbody) return;
-  const personFilter = document.getElementById("edit-filter-person").value;
-  const weekFilter   = document.getElementById("edit-filter-week").value;
-  let rows = state.entries.slice();
-  if (personFilter) rows = rows.filter((e) => nameKey(e.displayName || e.name) === nameKey(personFilter));
-  if (weekFilter)   rows = rows.filter((e) => e.weekStart === weekFilter);
-  rows.sort((a, b) => (b.date || "").localeCompare(a.date || ""));
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="muted center">No matching entries.</td></tr>`;
+  const boards = deriveFinalBoards();
+  const keys = new Set([...boards.fullTask.keys(), ...boards.rubric.keys()]);
+  const rows = [...keys].map((k) => {
+    const f = boards.fullTask.get(k);
+    const r = boards.rubric.get(k);
+    return {
+      key: k,
+      displayName: f?.displayName || r?.displayName || k,
+      ftNet:   f?.netScore    ?? 0,
+      ftRedo:  f?.redoCounter ?? 0,
+      rbNet:   r?.netScore    ?? 0,
+      rbRedo:  r?.redoCounter ?? 0,
+      anyOverlay: !!state.overlays[k],
+    };
+  });
+  rows.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
+  tbody.innerHTML = rows.length ? rows.map((r) => `
+    <tr>
+      <td>${escapeHtml(r.displayName)}${r.anyOverlay ? ' <span class="overlay-mark">&bull;</span>' : ''}</td>
+      <td>${r.ftNet}</td>
+      <td>${r.ftRedo}</td>
+      <td>${r.rbNet}</td>
+      <td>${r.rbRedo}</td>
+      <td class="row-actions"><button class="btn btn-secondary" data-edit-overlay="${escapeAttr(r.key)}">Edit overlay</button></td>
+    </tr>
+  `).join("") : `<tr><td colspan="6" class="muted center">No contributors yet — fetch the sheet first.</td></tr>`;
+
+  tbody.querySelectorAll("[data-edit-overlay]").forEach((btn) => {
+    btn.addEventListener("click", () => openOverlayEditor(btn.dataset.editOverlay));
+  });
+}
+
+function renderAliasesTable() {
+  const tbody = document.getElementById("aliases-tbody");
+  if (!tbody) return;
+  const entries = Object.entries(state.aliases);
+  if (!entries.length) {
+    tbody.innerHTML = `<tr><td colspan="3" class="muted center">No aliases yet.</td></tr>`;
     return;
   }
-  tbody.innerHTML = rows.map((e) => `
+  tbody.innerHTML = entries.map(([k, v]) => `
     <tr>
-      <td>${e.date || "—"}</td>
-      <td>${escapeHtml(e.displayName || e.name || "—")}</td>
-      <td>${Number(e.taskCount) || 0}</td>
-      <td>${e.type || "manual"}</td>
-      <td>${escapeHtml(e.enteredBy || "—")}</td>
-      <td class="row-actions">
-        <button class="btn btn-secondary" data-edit="${e.id}">Edit</button>
-        <button class="btn btn-danger" data-delete="${e.id}">Delete</button>
-      </td>
+      <td>${escapeHtml(k)}</td>
+      <td>${escapeHtml(v.canonical || "—")}</td>
+      <td class="row-actions"><button class="btn btn-danger" data-del-alias="${escapeAttr(k)}">Delete</button></td>
     </tr>
   `).join("");
-
-  tbody.querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => openEditEntry(b.dataset.edit)));
-  tbody.querySelectorAll("[data-delete]").forEach((b) => b.addEventListener("click", () => confirmDeleteEntry(b.dataset.delete)));
-}
-
-function openEditEntry(id) {
-  const e = state.entries.find((x) => x.id === id);
-  if (!e) return;
-  document.getElementById("edit-entry-id").value    = id;
-  document.getElementById("edit-entry-name").value  = e.displayName || e.name || "";
-  document.getElementById("edit-entry-date").value  = e.date || todayIsoInTz();
-  document.getElementById("edit-entry-count").value = Number(e.taskCount) || 0;
-  document.getElementById("edit-entry-error").hidden = true;
-  openModal("edit-entry-modal");
-}
-
-document.getElementById("edit-entry-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const errEl = document.getElementById("edit-entry-error");
-  errEl.hidden = true;
-  try {
-    const id   = document.getElementById("edit-entry-id").value;
-    const name = normalizeName(document.getElementById("edit-entry-name").value);
-    const date = document.getElementById("edit-entry-date").value;
-    const count = parseCount(document.getElementById("edit-entry-count").value);
-    if (!name) throw new Error("Name is required.");
-    if (!date) throw new Error("Date is required.");
-    await updateDoc(doc(db, "entries", id), {
-      name: nameKey(name),
-      displayName: name,
-      date,
-      weekStart: weekStartFromIso(date),
-      taskCount: count,
+  tbody.querySelectorAll("[data-del-alias]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirm(`Delete alias "${btn.dataset.delAlias}"?`)) return;
+      try {
+        await deleteDoc(doc(state.fb.db, "aliases", btn.dataset.delAlias));
+        showToast("Alias removed.", "success");
+      } catch (err) { showToast("Couldn't delete alias: " + err.message, "error"); }
     });
-    closeModal("edit-entry-modal");
-    showToast("Entry updated.", "success");
-  } catch (err) {
-    console.error(err);
-    errEl.textContent = err.message;
-    errEl.hidden = false;
-  }
-});
-
-async function confirmDeleteEntry(id) {
-  const e = state.entries.find((x) => x.id === id);
-  if (!e) return;
-  if (!confirm(`Delete this entry?\n\n${e.displayName} · ${e.date} · ${e.taskCount}`)) return;
-  try {
-    await deleteDoc(doc(db, "entries", id));
-    showToast("Entry deleted.", "success");
-  } catch (err) {
-    console.error(err);
-    showToast("Delete failed: " + err.message, "error");
-  }
+  });
 }
 
-// =============================================================================
-// Admin: rename person
-// =============================================================================
+// -----------------------------------------------------------------------------
+// Admin: add overlay-only person.
+// -----------------------------------------------------------------------------
 
-document.getElementById("rename-form").addEventListener("submit", async (ev) => {
+async function onAddPersonSubmit(ev) {
   ev.preventDefault();
-  const errEl = document.getElementById("rename-error");
+  const errEl = document.getElementById("add-person-error");
   errEl.hidden = true;
   try {
-    const from = document.getElementById("rename-from").value.trim();
-    const toRaw = document.getElementById("rename-to").value.trim();
-    const to    = normalizeName(toRaw);
-    if (!from) throw new Error("Pick a person to rename.");
-    if (!to)   throw new Error("Type the new display name.");
-    const fromKey = nameKey(from);
-    const matches = state.entries.filter((e) => nameKey(e.displayName || e.name) === fromKey);
-    if (!matches.length) throw new Error("No entries found for that person.");
-    if (!confirm(`Rename "${from}" → "${to}" across ${matches.length} entries?`)) return;
-    const batch = writeBatch(db);
-    for (const e of matches) {
-      batch.update(doc(db, "entries", e.id), {
-        name: nameKey(to),
-        displayName: to,
-      });
+    const name = normalizeNameRaw(document.getElementById("add-person-name").value);
+    if (!name) throw new Error("Name is required.");
+    const ftC = readNumOrNull("add-person-ft-completed");
+    const ftR = readNumOrNull("add-person-ft-redo");
+    const rbC = readNumOrNull("add-person-rb-completed");
+    const rbR = readNumOrNull("add-person-rb-redo");
+    const k = nameKey(name);
+    const adjustments = [];
+    const now = Date.now();
+    function adj(board, field, to) {
+      adjustments.push({ board, field, from: null, to, by: state.admin.name || "Admin", at: { seconds: Math.floor(now/1000) } });
     }
-    await batch.commit();
-    showToast(`Renamed ${matches.length} entries.`, "success");
-    document.getElementById("rename-to").value = "";
+    if (ftC !== null) adj("fullTask", "completed", ftC);
+    if (ftR !== null) adj("fullTask", "redoCounter", ftR);
+    if (rbC !== null) adj("rubric",   "completed", rbC);
+    if (rbR !== null) adj("rubric",   "redoCounter", rbR);
+    const payload = {
+      displayName: name,
+      addedByOverlayOnly: true,
+      fullTask: { ...(ftC !== null ? { completed: ftC } : {}), ...(ftR !== null ? { redoCounter: ftR } : {}) },
+      rubric:   { ...(rbC !== null ? { completed: rbC } : {}), ...(rbR !== null ? { redoCounter: rbR } : {}) },
+      adjustments,
+      updatedAt: serverTimestamp(),
+    };
+    await setDoc(doc(state.fb.db, "overlays", k), payload, { merge: true });
+    showToast(`Added overlay-only person: ${name}`, "success");
+    ["add-person-name","add-person-ft-completed","add-person-ft-redo","add-person-rb-completed","add-person-rb-redo"]
+      .forEach((id) => document.getElementById(id).value = "");
   } catch (err) {
     console.error(err);
     errEl.textContent = err.message;
     errEl.hidden = false;
   }
-});
-
-// =============================================================================
-// Historical import
-// =============================================================================
-
-function renderImportSectionVisibility() {
-  const section = document.getElementById("import-section");
-  if (!section) return;
-  section.hidden = !!state.meta?.historicalImported;
 }
 
-document.getElementById("import-btn").addEventListener("click", async () => {
-  if (!confirm("Pull last week's results from the Google Sheet and write entries for the week of 5/19 – 5/25? This runs once.")) return;
-  const btn = document.getElementById("import-btn");
-  const logEl = document.getElementById("import-log");
-  logEl.hidden = false;
-  logEl.textContent = "";
-  const log = (...args) => {
-    const line = args.map((a) => typeof a === "string" ? a : JSON.stringify(a, null, 2)).join(" ");
-    logEl.textContent += line + "\n";
-    console.log("[import]", ...args);
-  };
+function readNumOrNull(id) {
+  const v = document.getElementById(id).value.trim();
+  if (v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`Invalid number in field: ${id}`);
+  return Math.floor(n);
+}
 
+// -----------------------------------------------------------------------------
+// Admin: aliases.
+// -----------------------------------------------------------------------------
+
+async function onAliasSubmit(ev) {
+  ev.preventDefault();
+  const errEl = document.getElementById("alias-error");
+  errEl.hidden = true;
+  try {
+    const from = normalizeNameRaw(document.getElementById("alias-from").value);
+    const to   = normalizeNameRaw(document.getElementById("alias-to").value);
+    if (!from || !to) throw new Error("Both fields are required.");
+    const k = from.toLowerCase();
+    await setDoc(doc(state.fb.db, "aliases", k), {
+      canonical: to,
+      by: state.admin.name || "Admin",
+      at: serverTimestamp(),
+    });
+    showToast(`Alias saved: ${from} → ${to}`, "success");
+    document.getElementById("alias-from").value = "";
+    document.getElementById("alias-to").value = "";
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Admin: overlay editor.
+// -----------------------------------------------------------------------------
+
+function openOverlayEditor(personKey) {
+  const boards = deriveFinalBoards();
+  const f = boards.fullTask.get(personKey);
+  const r = boards.rubric.get(personKey);
+  const displayName = state.overlays[personKey]?.displayName || f?.displayName || r?.displayName || personKey;
+  document.getElementById("overlay-edit-title").textContent = "Edit overlay — " + displayName;
+  document.getElementById("overlay-edit-key").value = personKey;
+  document.getElementById("overlay-edit-error").hidden = true;
+
+  function setField(id, ovValue, liveValue) {
+    const el = document.getElementById(id);
+    el.value = (ovValue !== undefined && ovValue !== null) ? ovValue : "";
+    el.placeholder = "Live: " + liveValue;
+  }
+  const ov = state.overlays[personKey] || {};
+  setField("ovl-ft-completed", ov.fullTask?.completed,   f?.baseCompleted   ?? 0);
+  setField("ovl-ft-redo",      ov.fullTask?.redoCounter, f?.baseRedoCounter ?? 0);
+  setField("ovl-rb-completed", ov.rubric?.completed,     r?.baseCompleted   ?? 0);
+  setField("ovl-rb-redo",      ov.rubric?.redoCounter,   r?.baseRedoCounter ?? 0);
+
+  openModal("overlay-edit-modal");
+}
+
+async function onOverlayEditSubmit(ev) {
+  ev.preventDefault();
+  const errEl = document.getElementById("overlay-edit-error");
+  errEl.hidden = true;
+  try {
+    const k = document.getElementById("overlay-edit-key").value;
+    if (!k) throw new Error("No person key.");
+    const ftC = readBlankOrNum("ovl-ft-completed");
+    const ftR = readBlankOrNum("ovl-ft-redo");
+    const rbC = readBlankOrNum("ovl-rb-completed");
+    const rbR = readBlankOrNum("ovl-rb-redo");
+
+    const existing = state.overlays[k] || { adjustments: [] };
+    const boards = deriveFinalBoards();
+    const f = boards.fullTask.get(k);
+    const r = boards.rubric.get(k);
+    const adj = (existing.adjustments || []).slice();
+    const now = { seconds: Math.floor(Date.now() / 1000) };
+    function logChange(board, field, fromLive, fromOverlay, to) {
+      const before = (fromOverlay !== undefined && fromOverlay !== null) ? fromOverlay : fromLive;
+      if (before === to) return;
+      adj.push({ board, field, from: before, to, by: state.admin.name || "Admin", at: now });
+    }
+    logChange("fullTask", "completed",   f?.baseCompleted   ?? 0, existing.fullTask?.completed,   ftC);
+    logChange("fullTask", "redoCounter", f?.baseRedoCounter ?? 0, existing.fullTask?.redoCounter, ftR);
+    logChange("rubric",   "completed",   r?.baseCompleted   ?? 0, existing.rubric?.completed,     rbC);
+    logChange("rubric",   "redoCounter", r?.baseRedoCounter ?? 0, existing.rubric?.redoCounter,   rbR);
+
+    const displayName = existing.displayName || f?.displayName || r?.displayName || k;
+    const docPayload = {
+      displayName,
+      addedByOverlayOnly: !!existing.addedByOverlayOnly,
+      fullTask: {
+        ...(ftC !== null ? { completed: ftC } : {}),
+        ...(ftR !== null ? { redoCounter: ftR } : {}),
+      },
+      rubric: {
+        ...(rbC !== null ? { completed: rbC } : {}),
+        ...(rbR !== null ? { redoCounter: rbR } : {}),
+      },
+      adjustments: adj,
+      updatedAt: serverTimestamp(),
+    };
+    const hasAny = ftC !== null || ftR !== null || rbC !== null || rbR !== null;
+    if (!hasAny && !existing.addedByOverlayOnly) {
+      // Pure clear → delete overlay doc entirely.
+      await deleteDoc(doc(state.fb.db, "overlays", k));
+      showToast("Overlays cleared.", "success");
+    } else {
+      await setDoc(doc(state.fb.db, "overlays", k), docPayload);
+      showToast("Overlay saved.", "success");
+    }
+    closeModal("overlay-edit-modal");
+  } catch (err) {
+    console.error(err);
+    errEl.textContent = err.message;
+    errEl.hidden = false;
+  }
+}
+
+function readBlankOrNum(id) {
+  const v = document.getElementById(id).value.trim();
+  if (v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0) throw new Error("Numbers must be ≥ 0.");
+  return Math.floor(n);
+}
+
+async function onOverlayClearAll() {
+  const k = document.getElementById("overlay-edit-key").value;
+  if (!k) return;
+  if (!confirm("Remove all overlays for this person? Everything reverts to live values.")) return;
+  try {
+    await deleteDoc(doc(state.fb.db, "overlays", k));
+    showToast("Overlays removed.", "success");
+    closeModal("overlay-edit-modal");
+  } catch (err) {
+    showToast("Couldn't remove overlay: " + err.message, "error");
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Admin: start new week / swap sheet.
+// -----------------------------------------------------------------------------
+
+function extractSheetId(input) {
+  if (!input) return null;
+  const s = input.trim();
+  const m = s.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  if (m) return m[1];
+  if (/^[a-zA-Z0-9-_]{20,}$/.test(s)) return s;
+  return null;
+}
+
+function guessRangeLabel() {
+  if (!state.sheet.raw) return "";
+  const all = [];
+  const collect = (rows, cfg) => {
+    for (const row of rows) {
+      const d = normalizeDate(row[cfg.dateDone]);
+      if (d) all.push(d);
+    }
+  };
+  collect(state.sheet.raw.fullRows,   FULL);
+  collect(state.sheet.raw.rubricRows, RUBRIC);
+  if (!all.length) return "";
+  all.sort();
+  const fmt = (iso) => { const [, m, d] = iso.split("-").map(Number); return `${m}/${d}`; };
+  return all[0] === all[all.length - 1] ? fmt(all[0]) : `${fmt(all[0])} – ${fmt(all[all.length - 1])}`;
+}
+
+function isoDateRangeForLabel() {
+  if (!state.sheet.raw) return null;
+  const all = [];
+  for (const row of state.sheet.raw.fullRows)   { const d = normalizeDate(row[FULL.dateDone]);   if (d) all.push(d); }
+  for (const row of state.sheet.raw.rubricRows) { const d = normalizeDate(row[RUBRIC.dateDone]); if (d) all.push(d); }
+  if (!all.length) return null;
+  all.sort();
+  return { min: all[0], max: all[all.length - 1] };
+}
+
+async function onSwapSubmit(ev) {
+  ev.preventDefault();
+  const errEl = document.getElementById("swap-error");
+  errEl.hidden = true;
+  const btn = document.getElementById("swap-confirm");
   btn.disabled = true;
   try {
-    // Double-check the flag right before writing.
-    const fresh = await getDoc(metaDoc());
-    if (fresh.exists() && fresh.data().historicalImported) {
-      throw new Error("Historical import has already been run.");
+    const newId = extractSheetId(document.getElementById("swap-url").value);
+    if (!newId) throw new Error("Couldn't find a sheet ID in that URL.");
+    const label = (document.getElementById("swap-label").value || "").trim();
+    if (!label) throw new Error("Label is required.");
+
+    // Build snapshot from current overlaid boards.
+    const boards = deriveFinalBoards();
+    const ftRows = rowsForBoard("fullTask", boards).map((r) => ({
+      rank: r.rank, name: r.displayName,
+      completed: r.completed, outstandingRedo: r.outstandingRedo,
+      redoCounter: r.redoCounter, netScore: r.netScore,
+    }));
+    const rbRows = rowsForBoard("rubric", boards).map((r) => ({
+      rank: r.rank, name: r.displayName,
+      completed: r.completed, outstandingRedo: r.outstandingRedo,
+      redoCounter: r.redoCounter, netScore: r.netScore,
+    }));
+    const cmRows = rowsForBoard("combined", boards).map((r) => ({
+      rank: r.rank, name: r.displayName,
+      fullTaskNet: r.fullTaskNet, rubricNet: r.rubricNet,
+      totalRedos: r.totalRedos, score: r.score,
+    }));
+
+    // Per-person history (raw rows + base/overlay) for the modal in archive view.
+    const perPersonHistory = {};
+    for (const [k, f] of boards.fullTask) {
+      const r = boards.rubric.get(k);
+      perPersonHistory[k] = {
+        displayName: f.displayName || r?.displayName || k,
+        fullTask: f ? snapshotPerson(f) : null,
+        rubric:   r ? snapshotPerson(r) : null,
+        adjustments: (state.overlays[k]?.adjustments) || [],
+      };
+    }
+    for (const [k, r] of boards.rubric) {
+      if (perPersonHistory[k]) continue;
+      perPersonHistory[k] = {
+        displayName: r.displayName,
+        fullTask: null,
+        rubric: snapshotPerson(r),
+        adjustments: (state.overlays[k]?.adjustments) || [],
+      };
     }
 
-    log("Fetching Claim Sheet…");
-    const claimText = await fetchSheetCsv(HISTORICAL_SHEET_ID, "Claim Sheet");
-    log("Fetching Model Decomp Summary…");
-    const decompText = await fetchSheetCsv(HISTORICAL_SHEET_ID, "Model Decomp Summary");
+    // Doc id — slugify the iso range, fall back to a timestamp.
+    const range = isoDateRangeForLabel();
+    const docId = range ? `${range.min}_to_${range.max}` : `week_${Date.now()}`;
+    const archive = {
+      weekLabel: docId,
+      rangeLabel: label,
+      sourceSheetId: state.meta?.currentSheetId || state.sheet.id || "",
+      archivedBy: state.admin.name || "Admin",
+      archivedAt: serverTimestamp(),
+      boards: { fullTask: ftRows, rubric: rbRows, combined: cmRows },
+      perPersonHistory,
+    };
+    await setDoc(doc(state.fb.db, "archives", docId), archive);
 
-    const claimRows  = parseCsv(claimText);
-    const decompRows = parseCsv(decompText);
-
-    log(`Claim Sheet rows: ${claimRows.length}, Model Decomp rows: ${decompRows.length}`);
-
-    const claimCounts = parseClaimSheet(claimRows, log);
-    const decompResult = parseModelDecompSummary(decompRows, log);
-
-    // Roster = union of names across both tabs, including 0s.
-    const allKeys = new Set([
-      ...claimCounts.keys(),
-      ...decompResult.maxByKey.keys(),
-    ]);
-
-    log(`Combined roster size (pre-drop): ${allKeys.size}`);
-
-    const docsToWrite = [];
-    const breakdown = [];
-    for (const k of allKeys) {
-      const displayName =
-        claimCounts.get(k)?.displayName ||
-        decompResult.maxByKey.get(k)?.displayName ||
-        k;
-      const norm = normalizeName(displayName);
-      if (!norm) { log(`Dropping name: ${displayName}`); continue; }
-      const nd  = claimCounts.get(k)?.count ?? 0;
-      const md  = decompResult.maxByKey.get(k)?.count ?? 0;
-      const total = nd + md;
-      docsToWrite.push({ displayName: norm, total });
-      breakdown.push({
-        name: norm,
-        nonDecomp: nd,
-        decompSmall: decompResult.smallByKey.get(k)?.count ?? 0,
-        decompBig:   decompResult.bigByKey.get(k)?.count ?? 0,
-        decompUsed:  md,
-        total,
-      });
+    // Wipe overlays.
+    const overlaySnap = await getDocs(collection(state.fb.db, "overlays"));
+    for (const d of overlaySnap.docs) {
+      await deleteDoc(doc(state.fb.db, "overlays", d.id));
     }
-
-    // After alias merging, dedupe by normalized key (e.g., "Antoniio V" → "Antonio V")
-    const merged = new Map(); // key -> { displayName, total }
-    for (const d of docsToWrite) {
-      const norm = normalizeName(d.displayName);
-      if (!norm) continue;
-      const k = nameKey(norm);
-      if (!merged.has(k)) merged.set(k, { displayName: norm, total: 0 });
-      merged.get(k).total += d.total;
-    }
-
-    log(`Final roster size: ${merged.size}`);
-    log("Per-person breakdown:");
-    breakdown.sort((a, b) => a.name.localeCompare(b.name));
-    for (const r of breakdown) {
-      log(`  ${r.name.padEnd(20)} non-decomp=${r.nonDecomp}  decomp(small=${r.decompSmall}, big=${r.decompBig}, used=${r.decompUsed})  total=${r.total}`);
-    }
-
-    // Sanity check: Richards C must pick up at least 3 model decomp tasks.
-    const richardsK = "richards c";
-    if (merged.has(richardsK)) {
-      const rDecomp = decompResult.maxByKey.get(richardsK)?.count ?? 0;
-      log(`Sanity: Richards C model decomp (max-of-two-tables) = ${rDecomp}`);
-      if (rDecomp < 3) log(`⚠ Richards C decomp expected ≥ 3 — got ${rDecomp}. Inspect the Model Decomp Summary tab.`);
-    } else {
-      log(`⚠ Richards C not found in either tab. If they should be there, check spelling.`);
-    }
-
-    // Write entries
-    const batch = writeBatch(db);
-    let written = 0;
-    for (const [, person] of merged) {
-      const ref = doc(entriesCol());
-      batch.set(ref, {
-        name: nameKey(person.displayName),
-        displayName: person.displayName,
-        taskCount: person.total,
-        date: HISTORICAL_WEEK_END_DATE,
-        weekStart: HISTORICAL_WEEK_START,
-        enteredBy: "System",
-        type: "historical",
-        createdAt: serverTimestamp(),
-      });
-      written++;
-    }
-    batch.set(metaDoc(), {
-      historicalImported: true,
-      historicalImportedAt: serverTimestamp(),
+    // Point meta to the new sheet.
+    await setDoc(doc(state.fb.db, "meta", "site"), {
+      currentSheetId: newId,
+      schemaVersion: 1,
+      updatedAt: serverTimestamp(),
     }, { merge: true });
 
-    await batch.commit();
-    log(`Wrote ${written} historical entries. Import flag set.`);
-    showToast(`Historical import done — ${written} entries.`, "success");
+    showToast(`Archived "${label}" — now reading from new sheet.`, "success");
+    closeModal("swap-modal");
+    closeModal("admin-modal");
   } catch (err) {
     console.error(err);
-    showToast("Import failed: " + err.message, "error");
-    document.getElementById("import-log").textContent += "\nERROR: " + err.message + "\n";
+    errEl.textContent = err.message;
+    errEl.hidden = false;
   } finally {
     btn.disabled = false;
   }
-});
-
-async function fetchSheetCsv(sheetId, tabName) {
-  const url = sheetCsvUrl(sheetId, tabName);
-  const res = await fetch(url, { credentials: "omit" });
-  if (!res.ok) throw new Error(`Couldn't fetch tab "${tabName}" (HTTP ${res.status}). Make sure the sheet is shared "Anyone with the link can view".`);
-  return await res.text();
 }
 
-// ----- Claim Sheet parser -----
-// Find the header row containing "Claimed By" and "Task Completed". For each
-// subsequent row, if Task Completed is truthy, +1 for that Claimed By person.
-function parseClaimSheet(rows, log) {
-  let headerIdx = -1;
-  let claimedCol = -1;
-  let completedCol = -1;
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i].map((c) => String(c || "").trim().toLowerCase());
-    const ci = r.findIndex((c) => c === "claimed by" || c === "claimer" || c === "claimed_by");
-    const ti = r.findIndex((c) => c === "task completed" || c === "completed" || c === "task_completed");
-    if (ci >= 0 && ti >= 0) {
-      headerIdx = i; claimedCol = ci; completedCol = ti; break;
-    }
-  }
-  if (headerIdx < 0) {
-    log(`⚠ Claim Sheet: couldn't find "Claimed By" / "Task Completed" header — got 0 counts.`);
-    return new Map();
-  }
-  const counts = new Map(); // key -> { displayName, count }
-  for (let i = headerIdx + 1; i < rows.length; i++) {
-    const row = rows[i];
-    if (!row || !row.length) continue;
-    const personRaw = row[claimedCol];
-    const done = row[completedCol];
-    const norm = normalizeName(personRaw);
-    if (!norm) continue;
-    if (!truthyFlag(done)) continue;
-    const k = nameKey(norm);
-    if (!counts.has(k)) counts.set(k, { displayName: norm, count: 0 });
-    counts.get(k).count += 1;
-  }
-  // Also include people who appear in Claimed By with zero completions.
-  for (let i = headerIdx + 1; i < rows.length; i++) {
-    const row = rows[i];
-    if (!row || !row.length) continue;
-    const norm = normalizeName(row[claimedCol]);
-    if (!norm) continue;
-    const k = nameKey(norm);
-    if (!counts.has(k)) counts.set(k, { displayName: norm, count: 0 });
-  }
-  log(`Claim Sheet: ${counts.size} unique claimers, completed counts:`);
-  for (const [, v] of [...counts.entries()].sort((a, b) => a[1].displayName.localeCompare(b[1].displayName))) {
-    log(`  ${v.displayName}: ${v.count}`);
-  }
-  return counts;
+function snapshotPerson(stats) {
+  return {
+    baseCompleted: stats.baseCompleted, baseRedoCounter: stats.baseRedoCounter,
+    completed: stats.completed, redoCounter: stats.redoCounter,
+    outstandingRedo: stats.outstandingRedo, netScore: stats.netScore,
+    hasCompletedOverlay: stats.hasCompletedOverlay, hasRedoOverlay: stats.hasRedoOverlay,
+    rows: (stats.rows || []).map((r) => ({
+      taskId: r.taskId, date: r.date,
+      done: r.done, isRedo: r.isRedo, redoDone: r.redoDone, secondRedoDone: r.secondRedoDone,
+    })),
+  };
 }
 
-// ----- Model Decomp Summary parser -----
-// The sheet has TWO side-by-side tables both counting tasks done, plus a
-// Prompts Done table (which we skip). Scan all rows for header cells that
-// contain "task" + ("done"|"completed") and do NOT contain "prompt". For each
-// such header, the name column is the column immediately to its left (or, if
-// that column's header looks like a name/person label, use it). Read rows
-// below that header until a blank-name row; collect (name, count) pairs.
-// Group by normalized name and return BOTH per-table results and the max.
-function parseModelDecompSummary(rows, log) {
-  // Find all candidate task-count header cells.
-  const headers = []; // [{rowIdx, col, nameCol, label}]
-  for (let r = 0; r < rows.length; r++) {
-    const row = rows[r] || [];
-    for (let c = 0; c < row.length; c++) {
-      const raw = String(row[c] || "").trim();
-      const low = raw.toLowerCase();
-      if (!low) continue;
-      if (low.includes("prompt")) continue;
-      const hasTask = /task/.test(low);
-      const hasDone = /(done|completed|complete)/.test(low);
-      if (hasTask && hasDone) {
-        // Find name column near it. Walk left from c-1 looking for a non-empty header cell.
-        let nameCol = -1;
-        for (let cc = c - 1; cc >= Math.max(0, c - 4); cc--) {
-          const v = String(row[cc] || "").trim();
-          if (!v) continue;
-          // Prefer cells that look like a name/person header
-          if (/^(name|person|user|decomposer|model decomposer|decomp by|owner|engineer)\b/i.test(v)) {
-            nameCol = cc; break;
-          }
-          // Fall back: any non-empty header cell to the left
-          if (nameCol === -1) nameCol = cc;
-        }
-        if (nameCol === -1) nameCol = Math.max(0, c - 1);
-        headers.push({ rowIdx: r, col: c, nameCol, label: raw });
-      }
-    }
-  }
-  log(`Model Decomp Summary: detected ${headers.length} task-done header cell(s):`);
-  for (const h of headers) log(`  row ${h.rowIdx + 1}, col ${h.col}: "${h.label}" (name col = ${h.nameCol})`);
+// -----------------------------------------------------------------------------
+// Boot.
+// -----------------------------------------------------------------------------
 
-  // Read each table beneath its header.
-  const tables = headers.map((h) => readTableBelow(rows, h.rowIdx, h.nameCol, h.col));
-
-  // Group by normalized name across tables. Preserve per-table counts (for logging),
-  // and compute max per person. We also separate the "small" and "big" tables by
-  // total volume so the breakdown log mirrors the user's mental model.
-  const byKeyPerTable = tables.map((tbl) => {
-    const m = new Map();
-    for (const e of tbl) {
-      const norm = normalizeName(e.name);
-      if (!norm) continue;
-      const k = nameKey(norm);
-      if (!m.has(k)) m.set(k, { displayName: norm, count: 0 });
-      m.get(k).count += e.count; // sum within a single table if a name repeats
-    }
-    return m;
-  });
-
-  // Identify smaller vs larger table by total sum.
-  const sums = byKeyPerTable.map((m) => [...m.values()].reduce((s, v) => s + v.count, 0));
-  let smallIdx = 0, bigIdx = 0;
-  if (byKeyPerTable.length >= 2) {
-    if (sums[0] <= sums[1]) { smallIdx = 0; bigIdx = 1; } else { smallIdx = 1; bigIdx = 0; }
-  } else if (byKeyPerTable.length === 1) {
-    smallIdx = 0; bigIdx = 0;
-  }
-  const smallByKey = byKeyPerTable[smallIdx] || new Map();
-  const bigByKey   = byKeyPerTable[bigIdx]   || new Map();
-
-  // Max across all detected tables for each person.
-  const maxByKey = new Map();
-  const allKeys = new Set();
-  byKeyPerTable.forEach((m) => m.forEach((_, k) => allKeys.add(k)));
-  for (const k of allKeys) {
-    let best = { displayName: null, count: -1 };
-    for (const m of byKeyPerTable) {
-      const v = m.get(k);
-      if (v && v.count > best.count) best = { displayName: v.displayName, count: v.count };
-    }
-    if (best.count < 0) best = { displayName: k, count: 0 };
-    maxByKey.set(k, best);
-  }
-
-  log(`Model Decomp Summary: ${allKeys.size} unique decomposers across both tables.`);
-  for (const [, v] of [...maxByKey.entries()].sort((a, b) => a[1].displayName.localeCompare(b[1].displayName))) {
-    log(`  ${v.displayName}: max=${v.count}`);
-  }
-
-  return { smallByKey, bigByKey, maxByKey };
+async function boot() {
+  initFirebase();
+  attachEvents();
+  renderStatus();
+  // Probe Firebase (best-effort). If it fails the sheet still loads.
+  await probeFirebase();
+  if (state.fb.status === "connected") startListeners();
+  const sheetId = state.meta?.currentSheetId || DEFAULT_SHEET_ID;
+  await loadSheet(sheetId);
 }
 
-// Read (name, count) pairs in a table whose header is at row `headerRow`, with
-// the name column at `nameCol` and count column at `countCol`. Stop at the first
-// row whose name column is blank for ≥ 2 consecutive rows, or at EOF.
-function readTableBelow(rows, headerRow, nameCol, countCol) {
-  const out = [];
-  let blanks = 0;
-  for (let r = headerRow + 1; r < rows.length; r++) {
-    const row = rows[r] || [];
-    const rawName = (row[nameCol] || "").toString().trim();
-    if (!rawName) {
-      blanks++;
-      if (blanks >= 2) break;
-      continue;
-    }
-    blanks = 0;
-    // Skip rows that look like sub-headers
-    if (/^(name|person|user|decomposer|owner|total|grand total)$/i.test(rawName)) continue;
-    const count = parseCount(row[countCol]);
-    out.push({ name: rawName, count });
-  }
-  return out;
-}
-
-// =============================================================================
-// Small UI utilities
-// =============================================================================
-
-function showToast(msg, kind = "") {
-  const t = document.getElementById("toast");
-  t.textContent = msg;
-  t.className = "toast" + (kind ? " " + kind : "");
-  t.hidden = false;
-  clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => { t.hidden = true; }, 3200);
-}
-
-function escapeHtml(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-}
-function escapeAttr(s) { return escapeHtml(s); }
-
-// =============================================================================
-// Boot
-// =============================================================================
-
-startListeners();
-
-// Self-tests for week boundary (console-only). Helpful for verifying rollover.
-(function selfTests() {
-  // NOTE: in 2026, May 18 is a Monday, May 25 is a Monday, May 31 is a Sunday.
-  // (HISTORICAL_WEEK_START = "2026-05-19" is used verbatim as the entries'
-  // weekStart for the import — even though in the 2026 calendar that exact
-  // date falls on Tuesday. The import label "Week of 5/19 – 5/25" is rendered
-  // from that literal weekStart, so the user-facing label matches the spec.)
-  const cases = [
-    ["2026-05-18", "2026-05-18"], // Mon
-    ["2026-05-19", "2026-05-18"], // Tue → previous Mon
-    ["2026-05-24", "2026-05-18"], // Sun → Mon 5/18
-    ["2026-05-25", "2026-05-25"], // Mon
-    ["2026-05-26", "2026-05-25"], // Tue
-    ["2026-05-31", "2026-05-25"], // Sun → Mon 5/25
-    ["2026-06-01", "2026-06-01"], // Mon
-  ];
-  let ok = true;
-  for (const [d, expected] of cases) {
-    const got = weekStartFromIso(d);
-    if (got !== expected) { ok = false; console.warn(`week boundary FAIL ${d} → ${got}, expected ${expected}`); }
-  }
-  if (ok) console.log("[tsip] week-boundary self-tests OK");
-  console.log("[tsip] current Eastern date:", todayIsoInTz(), "→ weekStart:", currentWeekStart());
-})();
+boot();
